@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>RealWrld Inventory</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: transparent; }
+  #panels-wrap { position: absolute; inset: 0; display: none; pointer-events: none; }
+  #panels-wrap.on { display: block; pointer-events: auto; }
+  #printer-wrap { position: absolute; inset: 0; display: none; pointer-events: none; }
+
+  /* ── RealWrld toolbar (admin shops + throw) ─────────────────────── */
+  @font-face { font-family: 'Exo 2'; src: url('../panels/fonts/Exo2.woff2') format('woff2'); font-weight: 100 900; }
+  #rw-tools { position: fixed; left: 50%; bottom: 108px; transform: translateX(-50%); display: none; gap: 10px; z-index: 40; font-family: 'Exo 2', sans-serif; }
+  #rw-tools.show { display: flex; }
+  #rw-tools button { cursor: pointer; border: 1px solid rgba(168, 85, 247, .45); background: rgba(16, 12, 28, .94); color: #e9e4f5; font-family: 'Exo 2', sans-serif; font-size: 13px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; padding: 9px 20px; border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.5), inset 0 0 0 1px rgba(255,255,255,.04); transition: all .15s ease; }
+  #rw-tools button:hover { border-color: rgba(168, 85, 247, .95); box-shadow: 0 6px 24px rgba(0,0,0,.5), 0 0 18px rgba(168,85,247,.45); color: #fff; }
+  #rw-modal { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(4, 3, 10, .55); z-index: 50; font-family: 'Exo 2', sans-serif; }
+  #rw-modal.show { display: flex; }
+  .rw-card { width: 560px; max-width: 92vw; max-height: 74vh; display: flex; flex-direction: column; background: rgba(14, 11, 26, .94); border: 1px solid rgba(168, 85, 247, .35); border-radius: 14px; box-shadow: 0 24px 80px rgba(0,0,0,.7), 0 0 32px rgba(168,85,247,.12); color: #e9e4f5; overflow: hidden; }
+  .rw-card-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 10px; }
+  .rw-card-head h2 { margin: 0; font-size: 17px; letter-spacing: .18em; text-transform: uppercase; font-weight: 700; }
+  .rw-card-head h2 span { color: #a855f7; }
+  .rw-x { cursor: pointer; background: rgba(168,85,247,.12); border: 1px solid rgba(168,85,247,.4); color: #e9e4f5; width: 30px; height: 30px; border-radius: 8px; font-size: 15px; line-height: 1; }
+  .rw-x:hover { background: rgba(168,85,247,.3); }
+  .rw-search { margin: 4px 20px 10px; padding: 9px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,.09); background: rgba(255,255,255,.04); color: #fff; font-family: 'Exo 2', sans-serif; font-size: 14px; outline: none; }
+  .rw-search:focus { border-color: rgba(168,85,247,.7); }
+  .rw-body { overflow-y: auto; padding: 4px 20px 18px; }
+  .rw-group { margin: 12px 0 6px; font-size: 11px; letter-spacing: .22em; text-transform: uppercase; color: #9d8fc7; }
+  .rw-row { cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 13px; margin-bottom: 6px; border-radius: 9px; border: 1px solid rgba(255,255,255,.06); background: rgba(255,255,255,.03); transition: all .12s ease; }
+  .rw-row:hover { border-color: rgba(168,85,247,.65); background: rgba(168,85,247,.09); }
+  .rw-row .t { font-size: 14px; font-weight: 600; }
+  .rw-row .s { font-size: 12px; color: #9d8fc7; }
+  .rw-row .n { font-size: 12px; color: #c9bdf0; background: rgba(168,85,247,.16); padding: 2px 9px; border-radius: 20px; }
+  .rw-err { color: #fda4af; font-size: 13px; padding: 8px 2px; }
+  .rw-note { color: #9d8fc7; font-size: 13px; padding: 8px 2px; }
+  .rw-grid { display: grid; grid-template-columns: repeat(auto-fill, 76px); gap: 10px; }
+  .rw-tile { cursor: pointer; position: relative; width: 76px; height: 76px; border-radius: 10px; border: 1px solid rgba(255,255,255,.07); background: rgba(255,255,255,.03); display: flex; align-items: center; justify-content: center; transition: all .12s ease; }
+  .rw-tile:hover { border-color: rgba(168,85,247,.7); background: rgba(168,85,247,.1); }
+  .rw-tile img { max-width: 62px; max-height: 62px; pointer-events: none; }
+  .rw-tile .c { position: absolute; top: 4px; left: 6px; font-size: 11px; font-weight: 700; color: #fff; text-shadow: 0 1px 3px #000; }
+  .rw-tile .l { position: absolute; bottom: 3px; left: 0; right: 0; text-align: center; font-size: 9px; letter-spacing: .04em; color: #c9bdf0; text-transform: uppercase; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 4px; }
+</style>
+</head>
+<body>
+  <!-- Shell page (merged build): hosts the Creator V4 app and the RealWrld
+       panels app (his custom screens) in sibling iframes and routes Lua
+       NUI messages to each. Callbacks from either frame post directly to
+       the ox_inventory resource, so no Lua changes were needed. The
+       toolbar below is shell-native: the Creator app supports no custom
+       context actions, so Admin Shops + Throw live here. -->
+  <iframe id="inv" src="app.html" allowtransparency="true"></iframe>
+  <div id="panels-wrap"><iframe id="panels" src="../panels/index.html" allowtransparency="true"></iframe></div>
+  <div id="printer-wrap"><iframe id="printer-frame" src="../printer/index.html" allowtransparency="true"></iframe></div>
+
+  <div id="rw-tools">
+    <button id="rw-btn-admin" style="display:none">Admin Shops</button>
+  </div>
+  <div id="rw-modal">
+    <div class="rw-card">
+      <div class="rw-card-head"><h2 id="rw-modal-title">Menu</h2><button class="rw-x" id="rw-modal-x">&#10005;</button></div>
+      <input class="rw-search" id="rw-modal-search" placeholder="Search..." style="display:none">
+      <div class="rw-body" id="rw-modal-body"></div>
+    </div>
+  </div>
+
+  <script>
+    var PANEL_ACTIONS = {
+      init:1,
+      openMarket:1, refreshMarket:1, updateOrders:1, setupInventory:1, refreshSlots:1,
+      openTrade:1, closeTrade:1, tradeRequest:1, updateMyTradeItems:1, updateTheirTradeItems:1, setTheirConfirmed:1,
+      openStorageMenu:1, openStashSettings:1, requestStashPin:1, pinSetResult:1, pinVerifyResult:1, pinRemoveResult:1,
+      sharedUserAdded:1, sharedUserRemoved:1, fullStateSync:1,
+      openRecycler:1, closeRecycler:1, recyclerBridge:1, recyclerForward:1, recyclerCancelled:1,
+      recyclingProgress:1, recyclingComplete:1, startRecyclingProcess:1, receiveCollectedOutputs:1, updateCollectedOutputs:1, updateQueue:1,
+      openCrafting:1, closeCrafting:1, craftingProgress:1, craftingLevelUp:1, receiveRecipes:1, craftingComplete:1, craftingXPGain:1, updateXP:1, blueprintLearned:1, receiveInventory:1,
+      openGroundLoot:1, closeGroundLoot:1, openTheftLoot:1, closeTheftLoot:1, updateTheftLoot:1,
+      showScavengeLoot:1, hideScavengeLoot:1,
+      openSlingEditor:1, closeSlingEditor:1, openWeaponAttachments:1, openWeaponCustomization:1,
+      closeWeaponAttachments:1, closeWeaponCustomization:1, updateAttachmentPositions:1,
+      updateCurrentAttachments:1, updateSlotPositions:1, attach:1, remove:1, stashSecurityData:1, sharedUsersUpdate:1, closeStorageMenu:1
+    };
+    var inv = document.getElementById('inv');
+    var panels = document.getElementById('panels');
+    var wrap = document.getElementById('panels-wrap');
+    var PRINTER_ACTIONS = {
+      open:1, close:1, refresh:1, catalog:1, paused:1,
+      editor:1, 'editor:inspect':1, 'editor:printer':1, 'editor:removed':1, 'editor:catalog':1, 'editor:close':1,
+      cards:1, cardpos:1, textui:1, placement:1, audio:1
+    };
+    var printerFrame = document.getElementById('printer-frame');
+    var printerWrap = document.getElementById('printer-wrap');
+    var pMain = false, pEditor = false, pText = false, pPlace = false, pCards = false;
+    function renderPrinter() {
+      var show = pMain || pEditor || pText || pPlace || pCards;
+      var inter = pMain || pEditor;   // only the printer UI / admin console take input;
+      printerWrap.style.display = show ? 'block' : 'none';   // HUD overlays stay click-through
+      printerWrap.style.pointerEvents = inter ? 'auto' : 'none';
+      printerFrame.style.pointerEvents = inter ? 'auto' : 'none';
+    }
+    window.addEventListener('message', function (e) {
+      var d = e.data || {};
+      if (typeof d === 'string') {                   // raw-JSON SendNUIMessage (e.g. rwdrops prompts)
+        try { d = JSON.parse(d); } catch (err) { return; }
+      }
+      if (d.rwPanelVisible !== undefined) {           // from the panels app itself
+        wrap.className = d.rwPanelVisible ? 'on' : '';
+        return;
+      }
+      if (d.action && PRINTER_ACTIONS[d.action]) {     // 3D printer module (modules/rwprinter)
+        if (printerFrame.contentWindow) printerFrame.contentWindow.postMessage(d, '*');
+        if (d.action === 'open') pMain = true;
+        else if (d.action === 'close') pMain = false;
+        else if (d.action === 'editor') pEditor = true;
+        else if (d.action === 'editor:close') pEditor = false;
+        else if (d.action === 'textui') pText = d.show === true;
+        else if (d.action === 'placement') pPlace = d.show === true;
+        else if (d.action === 'cards') pCards = !!((d.cards && d.cards.length) || (d.cells && d.cells.length));
+        renderPrinter();
+        return;
+      }
+      if (d.action) {                                  // from Lua (SendNUIMessage)
+        if (inv.contentWindow) inv.contentWindow.postMessage(d, '*');
+        if (PANEL_ACTIONS[d.action] && panels.contentWindow) panels.contentWindow.postMessage(d, '*');
+      }
+    });
+  </script>
+
+  <script>
+  /* RealWrld toolbar: Admin Shops browser + Throw picker (shell-native). */
+  (function () {
+    'use strict';
+    var RES = window.GetParentResourceName ? window.GetParentResourceName() : 'ox_inventory';
+    var IMG = 'https://cfx-nui-' + RES + '/web/images/';
+    var HINTS = { weapons: 'Guns & melee', ammo: 'Rounds & clips', attachments: 'Sights, mags, tints', food: 'Food & drink', medical: 'Meds & armor', clothes: 'Clothing items', props: 'Tools & props', misc: 'Everything else' };
+    var invOpen = false, isAdmin = false, panelsOn = false, modalMode = null, shopRows = [];
+    var tools = document.getElementById('rw-tools');
+    var btnAdmin = document.getElementById('rw-btn-admin');
+    var modal = document.getElementById('rw-modal');
+    var mTitle = document.getElementById('rw-modal-title');
+    var mBody = document.getElementById('rw-modal-body');
+    var mSearch = document.getElementById('rw-modal-search');
+
+    function nui(cb, data) {
+      return fetch('https://' + RES + '/' + cb, { method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8' }, body: JSON.stringify(data || {}) })
+        .then(function (r) { return r.json().catch(function () { return null; }); });
+    }
+    function renderTools() {
+      tools.classList.toggle('show', invOpen && !panelsOn);
+      btnAdmin.style.display = isAdmin ? '' : 'none';
+    }
+    function closeModal() { modal.classList.remove('show'); modalMode = null; }
+    function openModal(mode) {
+      modalMode = mode;
+      mSearch.style.display = mode === 'admin' ? '' : 'none';
+      mSearch.value = '';
+      modal.classList.add('show');
+      if (mode === 'admin') loadShops(); else loadThrow();
+    }
+    function esc(t) { return String(t == null ? '' : t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+    function loadShops() {
+      mTitle.innerHTML = 'Admin <span>Shops</span>';
+      mBody.innerHTML = '<div class="rw-note">Loading...</div>';
+      nui('getAdminShops', {}).then(function (list) {
+        shopRows = Array.isArray(list) ? list : [];
+        if (!shopRows.length) { mBody.innerHTML = '<div class="rw-err">No catalogs returned. Check ACE: ox_inventory.admin / admin / command.additem</div>'; return; }
+        renderShops('');
+      }).catch(function () { mBody.innerHTML = '<div class="rw-err">Failed to load admin shops.</div>'; });
+    }
+    function renderShops(q) {
+      q = (q || '').toLowerCase();
+      var rows = shopRows.filter(function (r) { return !q || String(r.label).toLowerCase().includes(q) || String(r.id).toLowerCase().includes(q) || (HINTS[r.id] || '').toLowerCase().includes(q); });
+      var html = '';
+      [['catalog', 'Catalogs'], ['shop', 'City Shops']].forEach(function (g) {
+        var inGroup = rows.filter(function (r) { return r.kind === g[0]; });
+        if (!inGroup.length) return;
+        html += '<div class="rw-group">' + g[1] + '</div>';
+        inGroup.forEach(function (r) {
+          html += '<div class="rw-row" data-id="' + esc(r.id) + '" data-kind="' + esc(r.kind) + '"><div><div class="t">' + esc(r.label) + '</div><div class="s">' + esc(HINTS[r.id] || r.id) + '</div></div>' + (r.itemCount != null ? '<div class="n">' + r.itemCount + ' items</div>' : '') + '</div>';
+        });
+      });
+      mBody.innerHTML = html || '<div class="rw-err">Nothing matches.</div>';
+      Array.prototype.forEach.call(mBody.querySelectorAll('.rw-row'), function (el) {
+        el.addEventListener('click', function () {
+          nui('openAdminShop', { id: el.getAttribute('data-id'), kind: el.getAttribute('data-kind') }).then(function (ok) {
+            if (ok === false) { mBody.innerHTML = '<div class="rw-err">Could not open that shop. Check admin ACE permissions.</div>'; return; }
+            closeModal();
+          });
+        });
+      });
+    }
+    function loadThrow() {
+      mTitle.innerHTML = 'Throw <span>Item</span>';
+      mBody.innerHTML = '<div class="rw-note">Loading...</div>';
+      nui('rwTradeItems', {}).then(function (data) {
+        var list = (Array.isArray(data) ? data : Object.values(data || {})).filter(function (i) { return i && i.name && i.slot; });
+        list = list.filter(function (i) { return !i.name.toLowerCase().startsWith('weapon_'); });
+        if (!list.length) { mBody.innerHTML = '<div class="rw-err">Nothing to throw.</div>'; return; }
+        var html = '<div class="rw-grid">';
+        list.forEach(function (i) {
+          html += '<div class="rw-tile" data-slot="' + i.slot + '"><img src="' + IMG + esc(i.name) + '.png" onerror="this.onerror=null;this.src=\'' + IMG + 'fallback-item.png\'"><div class="c">' + (i.count > 1 ? i.count + 'x' : '') + '</div><div class="l">' + esc(i.label || i.name) + '</div></div>';
+        });
+        mBody.innerHTML = html + '</div>';
+        Array.prototype.forEach.call(mBody.querySelectorAll('.rw-tile'), function (el) {
+          el.addEventListener('click', function () {
+            nui('throwItem', { slot: parseInt(el.getAttribute('data-slot'), 10) });
+            closeModal();
+          });
+        });
+      }).catch(function () { mBody.innerHTML = '<div class="rw-err">Could not load your items.</div>'; });
+    }
+
+    btnAdmin.addEventListener('click', function () { openModal('admin'); });
+    document.getElementById('rw-modal-x').addEventListener('click', closeModal);
+    modal.addEventListener('click', function (e) { if (e.target === modal) closeModal(); });
+    mSearch.addEventListener('input', function () { if (modalMode === 'admin') renderShops(mSearch.value); });
+    window.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+    window.addEventListener('message', function (e) {
+      var d = e.data || {};
+      if (d.rwPanelVisible !== undefined) { panelsOn = !!d.rwPanelVisible; renderTools(); return; }
+      if (d.action === 'setupInventory') { invOpen = true; renderTools(); }
+      if (d.action === 'closeInventory') { invOpen = false; closeModal(); renderTools(); }
+      if (d.action === 'setInventoryAdmin') { isAdmin = d.data === true; renderTools(); }
+    });
+  })();
+  </script>
+
+  <script>
+  /* In-menu Throw + keyfob tooltip + quick actions (RealWrld) v4: slots carry data-slot;
+     the item menu is the node INSERTED by the right-click that holds the
+     Use/Give/Drop rows (the always-visible action bar pre-exists, so it
+     can never match); the fob section keys off the item name from Lua. */
+  (function () {
+    'use strict';
+    var RES = window.GetParentResourceName ? window.GetParentResourceName() : 'ox_inventory';
+    var invFrame = document.getElementById('inv');
+    var armed = null;   // {slot, x, y, t}
+    var hovered = null; // {slot}
+    var addedAt = new WeakMap(); // node -> timestamp it entered the doc
+    function nui(cb, data) {
+      return fetch('https://' + RES + '/' + cb, { method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8' }, body: JSON.stringify(data || {}) })
+        .then(function (r) { return r.json().catch(function () { return null; }); })
+        .catch(function () { return null; });
+    }
+    function esc(t) { return String(t == null ? '' : t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+    function playerSlot(t) {
+      if (!t || !t.closest) return null;
+      var el = t.closest('[data-slot]');
+      if (!el) return null;
+      var r = el.getBoundingClientRect();
+      if (r.left + r.width / 2 > window.innerWidth * 0.52) return null;
+      var n = parseInt(el.getAttribute('data-slot'), 10);
+      return (n && n > 0) ? n : null;
+    }
+    function labelLeaves(doc) {
+      var want = { Use: 1, Give: 1, Drop: 1 }, out = [], els = doc.querySelectorAll('button, [role="menuitem"], [role="button"], li, a, div, span');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (want[el.textContent.trim()] && el.querySelectorAll('*').length <= 3) out.push(el);
+      }
+      return out;
+    }
+    function commonRoot(a, b) {
+      var chain = [], n = a;
+      while (n) { chain.push(n); n = n.parentElement; }
+      n = b;
+      while (n) { if (chain.indexOf(n) >= 0) return n; n = n.parentElement; }
+      return null;
+    }
+    function freshNode(node) {
+      var n = node;
+      while (n) { if (addedAt.has(n)) return Date.now() - addedAt.get(n) < 2000; n = n.parentElement; }
+      return false;
+    }
+    // Relabel a cloned context-menu row WITHOUT wiping its icon: only the
+    // Use/Give/Drop text node is replaced (the old code set textContent on
+    // the whole button, which deleted the <i> icon), then the cloned icon
+    // is swapped for iconCls (same <i class="fa-solid ..."> format as the
+    // native rows). If the row had no icon at all, one is prepended.
+    function relabelRow(doc, row, text, iconCls) {
+      var done = false, walker = doc.createTreeWalker(row, 4), tn;
+      while ((tn = walker.nextNode())) {
+        if (/^(Use|Give|Drop)$/.test(tn.nodeValue.trim())) { tn.nodeValue = tn.nodeValue.replace(/(Use|Give|Drop)/, text); done = true; break; }
+      }
+      if (!done) {
+        (function setLabel(node) {
+          if (/^(Use|Give|Drop)$/.test(node.textContent.trim()) && node.children.length === 0) { node.textContent = text; return true; }
+          for (var k = 0; k < node.children.length; k++) if (setLabel(node.children[k])) return true;
+          return false;
+        })(row);
+      }
+      var keep = /^fa-(fw|2xs|xs|sm|lg|xl|2xl|\d+x)$/;
+      var ic = row.querySelector('i, svg');
+      var el = doc.createElement('i');
+      if (ic) {
+        var cls = (ic.getAttribute('class') || '').split(/\s+/).filter(function (c) { return c && (c.indexOf('fa') !== 0 || keep.test(c)) && c.indexOf('svg-inline') !== 0; });
+        el.className = cls.concat(['fa-solid', iconCls]).join(' ');
+        var st = ic.getAttribute('style'); if (st) el.setAttribute('style', st);
+        ic.parentNode.replaceChild(el, ic);
+      } else {
+        el.className = 'fa-solid ' + iconCls;
+        el.style.marginRight = '8px';
+        row.insertBefore(el, row.firstChild);
+      }
+    }
+    function tryThrowRow(doc) {
+      if (!armed || Date.now() - armed.t > 2000) return;
+      var leaves = labelLeaves(doc), byLabel = {};
+      for (var i = 0; i < leaves.length; i++) byLabel[leaves[i].textContent.trim()] = leaves[i];
+      if (!byLabel.Use || !byLabel.Drop) return;
+      var root = commonRoot(byLabel.Use, byLabel.Drop);
+      if (!root || root.hasAttribute('data-rw-throw')) return;
+      if (!freshNode(root)) return; // must be the menu the right-click just opened
+      root.setAttribute('data-rw-throw', '1');
+      var srcRow = byLabel.Drop.closest('button, [role="menuitem"], li') || byLabel.Drop.parentElement;
+      var row = srcRow.cloneNode(true);
+      relabelRow(doc, row, 'Throw', 'fa-baseball');
+      row.addEventListener('click', function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        if (armed) nui('throwItem', { slot: armed.slot });
+        armed = null;
+        try { doc.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (e) {}
+        try { doc.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+      }, true);
+      (srcRow.parentElement || root).appendChild(row);
+      if (!root.hasAttribute('data-rw-inspect')) {
+        root.setAttribute('data-rw-inspect', '1');
+        var slotAtOpen = armed.slot;
+        nui('rwKeyfobPlates', { slot: slotAtOpen }).then(function (res) {
+          if (!res || !res.name || !/^weapon_/i.test(res.name) || !root.isConnected) return;
+          var irow = srcRow.cloneNode(true);
+          relabelRow(doc, irow, 'Inspect', 'fa-magnifying-glass');
+          irow.addEventListener('click', function (ev) {
+            ev.preventDefault(); ev.stopPropagation();
+            nui('rwWeaponInspect', { slot: slotAtOpen });
+            armed = null;
+            try { doc.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true })); } catch (e) {}
+            try { doc.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+          }, true);
+          (srcRow.parentElement || root).appendChild(irow);
+        });
+      }
+    }
+    // ─── tooltip sections: detailed metadata + keyfob detail ───
+    // The old fob section anchored on '.tooltip-header-wrapper', a class
+    // that exists nowhere in the current app bundle (the app's tooltip
+    // classes are hashed CSS-module names, e.g. '_tooltip_1pswu_1'), so
+    // the section never attached and the keyfob tooltip never showed its
+    // vehicle data. Anchor on the module-class pattern / ARIA role
+    // instead, and feed both sections from the rwItemDetails Lua
+    // callback, which returns the hovered slot's full item instance —
+    // the Creator app itself only renders a fixed row set natively.
+    var tipCache = { slot: null, t: 0, data: null, spawned: null };
+    function tooltipCard(doc) {
+      var el = doc.querySelector('[class*="_tooltip_"], [role="tooltip"]');
+      if (el && (el.getClientRects().length || el.offsetParent)) return el;
+      return null;
+    }
+    function fmtMetaVal(v) {
+      if (v === true) return 'Yes';
+      if (v === false) return 'No';
+      if (typeof v === 'number') return String(Math.round(v * 100) / 100);
+      if (Array.isArray(v)) return v.map(fmtMetaVal).join(', ');
+      if (v && typeof v === 'object') {
+        return Object.keys(v).map(function (k) { return k + ': ' + fmtMetaVal(v[k]); }).join(', ');
+      }
+      return String(v);
+    }
+    function prettyKey(k) {
+      return k.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+    }
+    function ensureSection(doc, card, id) {
+      var s = card.querySelector('#' + id);
+      if (!s) {
+        s = doc.createElement('div');
+        s.id = id;
+        s.style.cssText = 'margin-top:8px;padding-top:8px;border-top:1px solid rgba(168,85,247,.25);font-size:12px;color:#c9bdf0;line-height:1.55;';
+        card.appendChild(s);
+      }
+      return s;
+    }
+    function setSection(sec, html) {
+      // Only write when the content actually changed: these sections live
+      // inside the observed subtree, so a redundant write would retrigger
+      // the MutationObserver forever.
+      if (sec.__rwHtml !== html) { sec.__rwHtml = html; sec.innerHTML = html; }
+      if (html) sec.style.display = ''; else sec.style.display = 'none';
+    }
+    function tryTooltipSections(doc) {
+      if (!hovered) return;
+      var card = tooltipCard(doc);
+      if (!card) return;
+      if (tipCache.slot !== hovered.slot || Date.now() - tipCache.t > 4000) {
+        tipCache = { slot: hovered.slot, t: Date.now(), data: null, spawned: null };
+        var slot = hovered.slot;
+        nui('rwItemDetails', { slot: slot }).then(function (res) {
+          if (res && tipCache.slot === slot) tipCache.data = res;
+        });
+        nui('getSpawnedPlates', {}).then(function (sp) {
+          if (tipCache.slot === slot) tipCache.spawned = (sp && sp.spawnedPlates) || [];
+        });
+        return; // sections render on the next observer tick, data in hand
+      }
+      var d = tipCache.data;
+      if (!d || !d.name) return;
+      var meta = d.metadata || {};
+      var isFob = (d.name === 'keyfob' || d.name === 'carkeys');
+      var fobSec = ensureSection(doc, card, 'rw-fob-section');
+      if (isFob) {
+        var plates = meta.plates || [];
+        var spawned = tipCache.spawned || [];
+        var rows = plates.map(function (pl) {
+          var out = spawned.indexOf(pl) >= 0;
+          return '<div>' + esc(pl) + (out ? ' <span style="color:#7ee787">● out</span>' : ' <span style="opacity:.55">stored</span>') + '</div>';
+        }).join('');
+        setSection(fobSec, '<span style="color:#a855f7;font-weight:700;letter-spacing:.08em;">KEYFOB</span>' +
+          '<div>Vehicles stored: ' + plates.length + '</div>' + rows);
+      } else {
+        setSection(fobSec, '');
+      }
+      var skip = {};
+      if (/^weapon_/i.test(d.name)) { skip.serial = 1; skip.components = 1; skip.tint = 1; }
+      var keys = Object.keys(meta).filter(function (k) { return k.charAt(0) !== '_' && !skip[k] && !(isFob && k === 'plates'); });
+      var detSec = ensureSection(doc, card, 'rw-details-section');
+      if (!keys.length) { setSection(detSec, ''); return; }
+      setSection(detSec, '<span style="color:#a855f7;font-weight:700;letter-spacing:.08em;">DETAILS</span>' + keys.map(function (k) {
+        var v = meta[k];
+        if (k === 'durability' && typeof v === 'number') v = Math.round(v) + '%';
+        return '<div><span style="opacity:.6">' + esc(prettyKey(k)) + '</span>&nbsp; ' + esc(fmtMetaVal(v)) + '</div>';
+      }).join(''));
+    }
+    // ─── settings → render bridge (icon shape/pack, durability) ───
+    // Revision round — the owner's instruction: these settings must
+    // work the way the app's other settings do, with no independent
+    // settings logic of ours. Traced in the app bundle
+    // (web/build/assets/index-BSF2Srbh.js, byte-identical to the
+    // pristine Creator zip except branding strings):
+    //  - The app's settings schema gives iconShape, iconPack and
+    //    durability the same {attr} apply descriptors as the working
+    //    settings: iconShape -> data-icon-shape, iconPack ->
+    //    data-icons, durability -> data-durability.
+    //  - The app persists each setting to its own per-key localStorage
+    //    entry "oxinv4:<key>" and its apply pass writes those values
+    //    onto the app document's <html>, where the CSS rule sets
+    //    (html[data-icon-shape=...], html[data-icons=...],
+    //    html[data-durability=...]) consume them.
+    // This bridge therefore does ONE thing: it carries the app's OWN
+    // saved values for those three keys from the app's OWN store onto
+    // <html> under the app's OWN schema attribute names. A key the app
+    // has never saved is left completely alone; where the app already
+    // applied a value, this writes the identical value (a no-op).
+    // Round 1's enforcer is removed: it hunted localStorage for a JSON
+    // settings object, but the app stores per-key scalars, so it could
+    // never fire.
+    var APP_SETTING_BRIDGE = [
+      ['oxinv4:iconShape', 'data-icon-shape'],
+      ['oxinv4:iconPack', 'data-icons'],
+      ['oxinv4:durability', 'data-durability']
+    ];
+    var bridgeApplied = {};
+    function applyAppSettings(doc) {
+      var win;
+      try { win = doc.defaultView; } catch (e) { return; }
+      if (!win) return;
+      var store;
+      try { store = win.localStorage; } catch (e) { return; }
+      if (!store) return;
+      var root = doc.documentElement;
+      for (var i = 0; i < APP_SETTING_BRIDGE.length; i++) {
+        var key = APP_SETTING_BRIDGE[i][0], attr = APP_SETTING_BRIDGE[i][1], v;
+        try { v = store.getItem(key); } catch (e) { continue; }
+        if (v === null || v === undefined || v === '') continue;
+        if (bridgeApplied[attr] === v) continue;
+        bridgeApplied[attr] = v;
+        root.setAttribute(attr, v);
+      }
+    }
+    // ─── clothing rail: realistic slot images ───
+    // The rails render font-glyph icons; the realistic slot art is the
+    // Creator package's own set (web/images/clothing_*.png in the
+    // vendor zip), copied to web/clothing/slot/ so it is NUI-servable.
+    // Swap the glyph for the image on any rail tile labelled with a
+    // clothing slot name. The current UI's clothing system has exactly
+    // these 12 slots (config.lua RWInv.Clothing); slots with no
+    // Creator art keep the app glyph.
+    var CLOTH = {
+      HAT: 'hat', MASK: 'mask', GLASSES: 'glasses', EARS: 'ears',
+      CHAIN: 'chain', WATCH: 'watch', SHIRT: 'shirt', JACKET: 'jacket',
+      ARMOR: 'armor', BAG: 'bag', PANTS: 'pants', SHOES: 'shoes'
+    };
+    function swapClothingIcons(doc) {
+      var els = doc.querySelectorAll('div, span, button, li');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (el.children.length > 2) continue;
+        var file = CLOTH[(el.textContent || '').trim().toUpperCase()];
+        if (!file) continue;
+        var tile = el;
+        for (var up = 0; up < 3 && tile; up++) {
+          if (tile.querySelector('i, svg')) break;
+          tile = tile.parentElement;
+        }
+        if (!tile || tile.__rwCloth) continue;
+        var icon = tile.querySelector('i, svg');
+        if (!icon || tile.querySelector('img')) continue;
+        var img = doc.createElement('img');
+        img.src = 'https://cfx-nui-' + RES + '/web/clothing/slot/clothing_' + file + '.png';
+        img.alt = file;
+        img.style.cssText = 'width:72%;height:72%;object-fit:contain;pointer-events:none;';
+        tile.__rwCloth = file;
+        icon.parentNode.replaceChild(img, icon);
+      }
+    }
+    function attach(doc) {
+      if (!doc || doc.__rwAttached4 || !doc.body) return;
+      doc.__rwAttached4 = true;
+      doc.addEventListener('contextmenu', function (e) {
+        var slot = playerSlot(e.target);
+        if (slot) armed = { slot: slot, x: e.clientX, y: e.clientY, t: Date.now() };
+      }, true);
+      doc.addEventListener('dblclick', function (e) {
+        var slot = playerSlot(e.target);
+        if (slot) nui('useItem', slot);
+      }, true);
+      doc.addEventListener('mouseover', function (e) {
+        var slot = playerSlot(e.target);
+        hovered = slot ? { slot: slot } : null;
+      }, true);
+      new MutationObserver(function (muts) {
+        for (var i = 0; i < muts.length; i++) for (var j = 0; j < muts[i].addedNodes.length; j++) {
+          var n = muts[i].addedNodes[j];
+          if (n.nodeType === 1) addedAt.set(n, Date.now());
+        }
+        tryThrowRow(doc); tryTooltipSections(doc);
+      }).observe(doc.body, { childList: true, subtree: true });
+      // Missing item images: swap any /web/images/ <img> that fails to
+      // load over to the shared fallback art instead of a broken tile.
+      doc.addEventListener('error', function (e) {
+        var t = e.target;
+        if (t && t.tagName === 'IMG' && !t.__rwFb && /\/web\/images\//.test(t.src || '')) {
+          t.__rwFb = true;
+          t.src = 'https://cfx-nui-' + RES + '/web/images/fallback-item.png';
+        }
+      }, true);
+      setInterval(function () { applyAppSettings(doc); swapClothingIcons(doc); }, 1000);
+    }
+    setInterval(function () {
+      try { attach(invFrame.contentWindow && invFrame.contentWindow.document); } catch (e) {}
+    }, 800);
+  })();
+  </script>
+</body>
+</html>
