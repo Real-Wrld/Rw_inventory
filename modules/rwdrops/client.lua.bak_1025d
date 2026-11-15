@@ -1,0 +1,1662 @@
+--  REALWRLD Software® · ox_inventory · Item Drop Physics · client
+-- ═════════════════════════════════════════════════════════════
+--
+--  Every ground drop becomes REAL props (the item's own model, weapons
+--  as their w_* model, everything without a model in ONE shared bag);
+--  they fall with physics, settle, stay kickable, and the prop the
+--  player LOOKS at gets the "[E] PICK UP" tag. The key takes only that
+--  item. Adding or taking items never re-drops what already lies there:
+--  props are reconciled item by item.
+--
+--  Folded in from the Item Drop Physics 2.1.0 add-on (design/drops.md).
+--  The inventory owns `client.drops` and the createDrop / removeDrop /
+--  setPlayerInventory events; this module only hangs its onEnter /
+--  onExit on those points and draws through the inventory's own NUI
+--  (`oxlynDropsPrompts`, a raw pre-formatted JSON string — never a
+--  per-frame json.encode).
+--
+--  Performance model:
+--    • nothing runs at all while no drop is inside renderDistance;
+--    • one SLOW pass every 250 ms decides what exists and what is close
+--      enough to draw (distances, spawning, instance checks, recovery);
+--    • one FAST pass every 8 ms only projects the props the slow pass
+--      picked — one native per frozen prop, two per live-physics prop —
+--      into reusable flat buffers, with no allocation and no string work;
+--    • the NUI is only fed when a marker moved by ≥ 1/2500 of the screen
+--      or the primary / key / label changed.
+-- ═════════════════════════════════════════════════════════════
+
+if not lib then return end
+
+local Shared = require 'modules.rwdrops.shared'
+local conf = require 'modules.rwconfig.shared'.Get()
+local featureOn = not conf.Features or conf.Features.itemDrops ~= false
+
+---@class RWDropsModule
+local RWDrops = {
+    featureOn = featureOn,
+    enabled = false,
+    renderDistance = Shared.DEFAULTS.renderDistance,
+    config = Shared.sanitizeDropsConfig(nil),
+}
+
+-- Feature switched off in config.lua: a no-op module, so callers can
+-- always read `RWDrops.enabled` and call every function.
+if not featureOn then
+    local function noop() end
+    RWDrops.onEnter, RWDrops.onExit, RWDrops.remove, RWDrops.clearAll = noop, noop, noop, noop
+    RWDrops.applyConfig, RWDrops.applyPropMap, RWDrops.updateDropItems = noop, noop, noop
+    RWDrops.pickupPrimary, RWDrops.setMarker = noop, noop
+    RWDrops.preview = function() return false, 'disabled' end
+    RWDrops.getPrimary = function() return nil end
+    -- Settings › Ground drops asks which look drops have: always the
+    -- classic bag here (modules/rwdroppoints).
+    RegisterNUICallback('rwDropsState', function(_, cb)
+        cb({ enabled = false, feature = false })
+    end)
+    -- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+    RegisterNUICallback('oxlynDropsState', function(_, cb)
+        cb({ enabled = false, feature = false })
+    end)
+    return RWDrops
+end
+
+local Items = require 'modules.items.client'
+local Utils = require 'modules.utils.client'
+
+-- ─── config ─────────────────────────────────────────────────
+local cfg = Shared.sanitizeDropsConfig(conf.Drops or conf.ItemDrops)
+RWDrops.enabled = cfg.enabled
+RWDrops.renderDistance = cfg.renderDistance
+RWDrops.config = cfg
+
+-- Hot-path constants, hoisted so the per-frame pass never touches a table.
+-- Reassigned by applyConfig.
+local RENDER_DISTANCE = cfg.renderDistance
+local RING_DISTANCE = cfg.ringDistance
+local PROMPT_DISTANCE = cfg.promptDistance
+local SCATTER_RADIUS = cfg.scatterRadius
+local LIVE_PROPS = cfg.physics and cfg.keepPhysics
+local MAX_PROMPTS = cfg.maxPrompts
+local MAX_TOTAL_PROPS = cfg.maxTotalProps
+local MARKER_NONE = false
+
+-- ─── prop model resolution ──────────────────────────────────
+-- Effective map: the local seed (data/itemProps.lua) until the server's
+-- versioned payload arrives, then that.
+local propMap, seedCategories
+do
+    -- a data/ folder kept from 3.0-3.3 has no itemProps.lua: lib.load raises
+    local ok, seedMap = pcall(lib.load, 'data.itemProps')
+    propMap, seedCategories = Shared.normalizeMap(ok and seedMap or {})
+end
+local propMapVersion = 0
+local propMapDefaults = { bagModel = type(seedCategories.default) == 'string' and seedCategories.default or nil }
+local resolved = {}   -- itemName -> { model = hash, weapon = bool, … } | { skip = true } | false
+
+---First model of a string / list that exists in the game files.
+---@param candidate string | number | table | nil
+---@return number? hash, string? name
+local function firstValidModel(candidate)
+    if candidate == nil then return end
+
+    if type(candidate) == 'table' then
+        for i = 1, #candidate do
+            local hash, name = firstValidModel(candidate[i])
+            if hash then return hash, name end
+        end
+
+        return
+    end
+
+    local hash = type(candidate) == 'string' and joaat(candidate) or candidate
+    local name = type(candidate) == 'string' and candidate or nil
+
+    if type(hash) == 'number' and IsModelInCdimage(hash) and IsModelValid(hash) then
+        return hash, name
+    end
+end
+
+local fallbackHash
+
+local function recomputeFallback()
+    fallbackHash = firstValidModel(cfg.bagModel) or firstValidModel(propMapDefaults.bagModel) or joaat('prop_med_bag_01b')
+end
+
+recomputeFallback()
+
+---Only items with an EXPLICIT entry in the prop map (or weapons with their
+---w_* model) get their own prop. Everything else is gathered into ONE bag
+---prop per drop, so a pile of ammo never turns into a pile of crates.
+---@param name string
+---@return table? entry  { model, weapon, physics?, offset?, rotation?, stackLimit? } | { skip = true }
+local function propFor(name)
+    local cached = resolved[name]
+    if cached ~= nil then return cached or nil end
+
+    local entry = propMap[name]
+    local out = false
+
+    if entry and not entry.bag then
+        local isWeapon = name:sub(1, 7) == 'WEAPON_'
+        local hash, modelName
+
+        if not isWeapon or cfg.weaponProps then
+            hash, modelName = firstValidModel(entry.model)
+        end
+
+        if hash then
+            out = {
+                model = hash,
+                weapon = modelName ~= nil and modelName:sub(1, 2) == 'w_',
+                physics = entry.physics,
+                offset = entry.offset,
+                rotation = entry.rotation,
+                stackLimit = entry.stackLimit,
+            }
+        elseif entry.bagWhenUnknown == false then
+            out = { skip = true }
+        end
+    end
+
+    resolved[name] = out
+
+    return out or nil
+end
+
+---Deterministic item order: heaviest first, then by name.
+---@param items table<string, number>
+---@return string[]
+local function sortedNames(items)
+    local names = {}
+
+    for name, count in pairs(items) do
+        if type(name) == 'string' and (tonumber(count) or 0) > 0 then
+            names[#names + 1] = name
+        end
+    end
+
+    table.sort(names, function(a, b)
+        local wa, wb = Items[a]?.weight or 0, Items[b]?.weight or 0
+        if wa ~= wb then return wa > wb end
+        return a < b
+    end)
+
+    return names
+end
+
+---Build the list of props a drop should show.
+---@param point table CPoint (drop)
+---@return table[] entries, string signature
+local function entriesFor(point)
+    local entries = {}
+
+    -- Custom drops (exports.ox_inventory:CustomDrop) can carry their own model.
+    if point.model then
+        local hash = firstValidModel(point.model) or fallbackHash
+        if hash then entries[1] = { model = hash, weapon = false, key = 'model' } end
+        return entries, tostring(hash)
+    end
+
+    local items = type(point.items) == 'table' and point.items or nil
+    local names = items and sortedNames(items) or {}
+
+    -- A drop we KNOW is empty renders nothing at all. This is the state
+    -- right after the last item is picked up: the server has already sent
+    -- the emptied item map and `removeDrop` is one frame behind it.
+    -- (`items == nil` is different — the map simply has not arrived yet,
+    -- and there the bag is the right placeholder.)
+    if items and #names == 0 then return entries, '' end
+
+    -- The bag stands for every item WITHOUT a prop of its own; `names`
+    -- lists them so picking the bag takes exactly those.
+    local bagNames = {}
+    local bag = fallbackHash and { model = fallbackHash, weapon = false, bag = true, names = bagNames } or nil
+
+    local function propEntry(name)
+        local prop = propFor(name)
+        if not prop then return nil end
+        if prop.skip then return prop end
+        return { model = prop.model, weapon = prop.weapon, name = name, physics = prop.physics, offset = prop.offset, rotation = prop.rotation, stackLimit = prop.stackLimit }
+    end
+
+    if cfg.mode == 'bag' or #names == 0 then
+        for i = 1, #names do bagNames[#bagNames + 1] = names[i] end
+        if bag then entries[1] = bag end
+    elseif cfg.mode == 'item' then
+        local first = propEntry(names[1])
+        if first and not first.skip then
+            entries[1] = first
+        else
+            for i = 1, #names do bagNames[#bagNames + 1] = names[i] end
+            if bag then entries[1] = bag end
+        end
+    else
+        for i = 1, #names do
+            local entry = propEntry(names[i])
+
+            if entry then
+                if not entry.skip and #entries < cfg.maxProps then entries[#entries + 1] = entry end
+            else
+                bagNames[#bagNames + 1] = names[i]
+            end
+        end
+
+        -- Stacks of a few real objects get extra copies while there is room:
+        -- three bottles of water lie on the ground as three bottles. A BIG
+        -- stack does not (250 cash is a quantity, not 250 objects); above
+        -- `stackMaxCount` one prop stands for the whole amount, and a
+        -- per-item `stackLimit` caps it further (0 = never copy).
+        if #entries < cfg.maxProps and cfg.stackCopies > 1 then
+            for i = 1, #names do
+                local entry = propEntry(names[i])
+                local count = tonumber(items[names[i]]) or 1
+
+                if count > cfg.stackMaxCount then count = 1 end
+
+                if entry and not entry.skip and not entry.weapon then
+                    local extra = math.min(count, cfg.stackCopies, (entry.stackLimit or cfg.stackCopies) + 1) - 1
+
+                    for _ = 1, extra do
+                        if #entries >= cfg.maxProps then break end
+                        entries[#entries + 1] = { model = entry.model, weapon = entry.weapon, name = entry.name, physics = entry.physics, offset = entry.offset, rotation = entry.rotation }
+                    end
+                end
+            end
+        end
+
+        -- One bag for everything that has no prop of its own.
+        if (#bagNames > 0 or #entries == 0) and bag then
+            table.insert(entries, 1, bag)
+        end
+    end
+
+    -- Stable identity per prop: the same item keeps the same key across
+    -- updates, so reconciliation can leave it exactly where it lies.
+    local copies = {}
+    local sig = {}
+
+    for i = 1, #entries do
+        local e = entries[i]
+
+        if e.bag then
+            e.key = 'bag'
+        elseif e.name then
+            copies[e.name] = (copies[e.name] or 0) + 1
+            e.key = ('%s#%d'):format(e.name, copies[e.name])
+        else
+            e.key = ('model#%d'):format(i)
+        end
+
+        sig[i] = e.key .. '@' .. tostring(e.model)
+    end
+
+    return entries, table.concat(sig, ',')
+end
+
+-- ─── seeded LCG (all clients agree on the scatter) ──────────
+local function makeRng(id)
+    local seed = math.tointeger(joaat(tostring(id))) or 1
+    seed = seed & 0x7fffffff
+
+    return function()
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        return seed / 0x7fffffff
+    end
+end
+
+-- ─── rarity (feeds the prompt tint) ─────────────────────────
+local rarityMap = client.rarity and (lib.load('data.itemRarity') or {}) or {}
+
+-- ─── props ──────────────────────────────────────────────────
+local activePoints = {}   -- point -> true while inside renderDistance
+local activeCount = 0
+local loopRunning = false
+
+-- Set whenever the set of props on the ground changes, so the prompt loop
+-- re-scans on its next frame instead of waiting for the slow pass.
+local scanDirty = true
+
+-- Every prop this module ever created, obj -> point. Deleting goes through
+-- here, and a sweeper double-checks that nothing outlives its drop.
+local tracked = {}
+local trackedCount = 0
+local pendingCount = 0   -- props reserved by running spawn threads (cap accounting)
+local sweeperRunning = false
+local capWarnedAt = 0
+
+local function deleteProp(obj)
+    if tracked[obj] ~= nil then
+        tracked[obj] = nil
+        trackedCount = trackedCount - 1
+    end
+
+    scanDirty = true
+
+    if not obj or obj == 0 or not DoesEntityExist(obj) then return end
+
+    SetEntityAsMissionEntity(obj, true, true)
+    DeleteObject(obj)
+
+    if DoesEntityExist(obj) then
+        DeleteEntity(obj)
+    end
+end
+
+local function pointIsLive(point)
+    -- the admin preview prop is not a drop: its own timer removes it
+    if point and point.invId == '__preview' then return true end
+    return point and activePoints[point] and point.oxProps ~= nil and client.drops and client.drops[point.invId] == point
+end
+
+local function runSweeper()
+    if sweeperRunning then return end
+    sweeperRunning = true
+
+    CreateThread(function()
+        while trackedCount > 0 do
+            Wait(1500)
+
+            for obj, point in pairs(tracked) do
+                if not pointIsLive(point) then
+                    deleteProp(obj)
+                elseif not DoesEntityExist(obj) then
+                    tracked[obj] = nil
+                    trackedCount = trackedCount - 1
+                    scanDirty = true
+                end
+            end
+
+            if trackedCount >= MAX_TOTAL_PROPS then
+                local now = GetGameTimer()
+                if now - capWarnedAt >= 60000 then
+                    capWarnedAt = now
+                    lib.print.warn(('[rw drops] %d props alive — at the maxTotalProps cap (%d)'):format(trackedCount, MAX_TOTAL_PROPS))
+                end
+            end
+        end
+
+        sweeperRunning = false
+    end)
+end
+
+local function track(obj, point)
+    if tracked[obj] == nil then
+        trackedCount = trackedCount + 1
+    end
+    tracked[obj] = point
+    runSweeper()
+end
+
+-- Centre of a prop's model (GetEntityCoords is the model origin, often the
+-- base corner) so the marker sits ON the item. Cached per model.
+local modelCentre = {}
+
+local function centreOffset(model)
+    local c = modelCentre[model]
+
+    if c == nil then
+        local min, max = GetModelDimensions(model)
+        c = min and max and vec3((min.x + max.x) / 2, (min.y + max.y) / 2, (min.z + max.z) / 2) or false
+        modelCentre[model] = c
+    end
+
+    return c
+end
+
+local function propCentre(obj, model)
+    local c = centreOffset(model)
+
+    if c then
+        return GetOffsetFromEntityInWorldCoords(obj, c.x, c.y, c.z)
+    end
+
+    return GetEntityCoords(obj)
+end
+
+local function despawn(point)
+    point.oxGen = (point.oxGen or 0) + 1
+
+    local props = point.oxProps
+    point.oxProps = nil
+    point.oxPropMeta = nil
+    scanDirty = true
+
+    -- Anything registered for this point goes, listed or not.
+    for obj, owner in pairs(tracked) do
+        if owner == point then deleteProp(obj) end
+    end
+
+    if props then
+        for i = 1, #props do deleteProp(props[i]) end
+    end
+end
+
+---Ground point under a world coordinate (the drop coord is the PED's
+---centre, roughly a metre above the floor).
+local function groundAt(x, y, z)
+    local found, gz = GetGroundZFor_3dCoord(x, y, z + 1.0, false)
+    return vec3(x, y, (found and gz or z - 0.9) + 0.1)
+end
+
+---Deterministic scatter offset for entry `index` of a drop.
+local function offsetsFor(point, count)
+    local rng = makeRng(point.invId)
+    local out = {}
+
+    for i = 1, math.max(1, count) do
+        local angle = rng() * math.pi * 2
+        local radius = cfg.mode == 'scatter' and SCATTER_RADIUS * math.sqrt(rng()) or 0.0
+        out[i] = { angle = angle, radius = radius, heading = rng() * 360.0, r1 = rng(), r2 = rng(), r3 = rng(), r4 = rng(), r5 = rng(), r6 = rng() }
+    end
+
+    return out
+end
+
+---Marker anchor on the ground, available synchronously.
+local function ensureAnchor(point)
+    if point.oxAnchor then return point.oxAnchor end
+
+    local c = point.coords
+    local o = offsetsFor(point, 1)[1]
+    local radius = math.max(o.radius, 0.18)
+    local anchor = groundAt(c.x + math.cos(o.angle) * radius, c.y + math.sin(o.angle) * radius, c.z)
+
+    point.oxAnchor = vec3(anchor.x, anchor.y, anchor.z + 0.05)
+    return point.oxAnchor
+end
+
+local function applyRotation(obj, entry, o)
+    local rot = entry.rotation
+
+    if rot then
+        SetEntityRotation(obj, rot.x + 0.0, rot.y + 0.0, o.heading + rot.z, 2, true)
+    elseif entry.weapon then
+        SetEntityRotation(obj, cfg.weaponRotation.pitch + 0.0, cfg.weaponRotation.roll + 0.0, o.heading, 2, true)
+    else
+        SetEntityHeading(obj, o.heading)
+    end
+end
+
+---Spawn ONE prop for `entry` at scatter offset `o`. Runs inside a thread
+---(waits while the prop streams / settles). Returns the object, or nil when
+---the point generation changed underneath it. Shared with the admin preview.
+---@return number? obj
+local function spawnOne(point, entry, o, ground, gen, fresh, usePhysics)
+    local model = entry.model
+    local c = point.coords
+    local radius = o.radius
+    local px, py = c.x + math.cos(o.angle) * radius, c.y + math.sin(o.angle) * radius
+    local offz = 0.0
+
+    if entry.offset then
+        px, py, offz = px + entry.offset.x, py + entry.offset.y, entry.offset.z
+        ground = groundAt(px, py, c.z)
+    end
+
+    lib.requestModel(model, 3000)
+
+    if point.oxGen ~= gen or not point.oxProps then
+        SetModelAsNoLongerNeeded(model)
+        return
+    end
+
+    local spawnZ = (fresh and usePhysics and (ground.z + 0.35 + o.r1 * 0.25) or (ground.z + 0.08)) + offz
+    local obj = CreateObjectNoOffset(model, px, py, spawnZ, false, false, false)
+    SetModelAsNoLongerNeeded(model)
+
+    if not obj or obj == 0 then return end
+
+    track(obj, point)
+    applyRotation(obj, entry, o)
+
+    if usePhysics then
+        SetEntityDynamic(obj, true)
+        SetEntityCollision(obj, true, true)
+        ActivatePhysics(obj)
+
+        if fresh then
+            SetEntityVelocity(obj, (o.r2 - 0.5) * 0.5, (o.r3 - 0.5) * 0.5, 0.2 + o.r4 * 0.3)
+            SetEntityAngularVelocity(obj, (o.r5 - 0.5) * 4.0, (o.r6 - 0.5) * 4.0, (o.r1 - 0.5) * 2.0)
+        end
+
+        local started = GetGameTimer()
+
+        repeat
+            Wait(100)
+
+            if point.oxGen ~= gen or not point.oxProps then
+                deleteProp(obj)
+                return
+            end
+        until GetGameTimer() - started > cfg.settleMs or (GetGameTimer() - started > 600 and #(GetEntityVelocity(obj)) < 0.03)
+
+        local oc = GetEntityCoords(obj)
+
+        local ddx, ddy = oc.x - px, oc.y - py
+
+        if math.sqrt(ddx * ddx + ddy * ddy) > SCATTER_RADIUS + 1.0 or math.abs(oc.z - ground.z) > 2.0 then
+            SetEntityCoordsNoOffset(obj, px, py, ground.z + 0.05 + offz, false, false, false)
+            PlaceObjectOnGroundProperly(obj)
+        end
+    elseif cfg.placeOnGround then
+        local attempts = 0
+
+        while not PlaceObjectOnGroundProperly(obj) and attempts < 5 do
+            attempts = attempts + 1
+            Wait(50)
+
+            if point.oxGen ~= gen or not point.oxProps then
+                deleteProp(obj)
+                return
+            end
+        end
+
+        -- PlaceObjectOnGroundProperly re-orients: a per-item rotation is
+        -- applied again after it, before the freeze.
+        if entry.rotation then applyRotation(obj, entry, o) end
+    end
+
+    if point.oxGen ~= gen or not point.oxProps then
+        deleteProp(obj)
+        return
+    end
+
+    SetEntityInvincible(obj, true)
+    SetEntityCanBeDamaged(obj, false)
+
+    if cfg.keepPhysics and usePhysics then
+        FreezeEntityPosition(obj, false)
+        SetEntityCollision(obj, true, true)
+    else
+        FreezeEntityPosition(obj, true)
+        SetEntityDynamic(obj, false)
+        SetEntityCollision(obj, false, false)
+        SetEntityProofs(obj, true, true, true, true, true, true, true, true)
+    end
+
+    return obj
+end
+
+---Create the props for `jobs` ({ entry, index } pairs) and append them
+---to `point.oxProps`. Runs in its own thread; aborts cleanly when the point
+---generation changes underneath it.
+local function createProps(point, jobs, gen, count)
+    local c = point.coords
+    local offsets = offsetsFor(point, math.max(count, #jobs))
+
+    pendingCount = pendingCount + #jobs
+
+    CreateThread(function()
+        for j = 1, #jobs do
+            local job = jobs[j]
+            local i = job.index
+            pendingCount = pendingCount - 1
+            local okEntry, entryErr = pcall(function()
+                local entry = job.entry
+                local o = offsets[i] or offsets[#offsets]
+                -- entry 1 is always nudged off the exact drop coord so
+                -- stacked drops separate (same rule as ensureAnchor)
+                if i == 1 and o.radius < 0.18 then
+                    o = { angle = o.angle, radius = 0.18, heading = o.heading, r1 = o.r1, r2 = o.r2, r3 = o.r3, r4 = o.r4, r5 = o.r5, r6 = o.r6 }
+                end
+                local ground = groundAt(c.x + math.cos(o.angle) * o.radius, c.y + math.sin(o.angle) * o.radius, c.z)
+                local fresh = point.oxFresh == true
+                local usePhysics = (entry.physics ~= false) and cfg.physics and (fresh or cfg.keepPhysics)
+
+                local obj = spawnOne(point, entry, o, ground, gen, fresh, usePhysics)
+                if not obj then return end
+
+                -- The marker id is the prop's stable key, so a prop that
+                -- stays through a reconcile keeps its marker.
+                entry.id = point.invId .. '#' .. (entry.key or tostring(i))
+                entry.rarityJson = nil
+
+                point.oxProps[#point.oxProps + 1] = obj
+                point.oxPropMeta = point.oxPropMeta or {}
+                point.oxPropMeta[obj] = entry
+                scanDirty = true
+
+                if i == 1 then
+                    local pc = propCentre(obj, entry.model)
+                    point.oxAnchor = vec3(pc.x, pc.y, pc.z)
+                end
+            end)
+
+            if not okEntry then
+                lib.print.error(('[rw drops] failed to spawn prop %d of %s: %s'):format(i, point.invId, entryErr))
+            end
+
+            if point.oxGen ~= gen or not point.oxProps then
+                pendingCount = pendingCount - (#jobs - j)
+                return
+            end
+        end
+
+        -- Only the very first spawn of a drop tumbles with physics.
+        point.oxFresh = false
+
+        if point.oxProps and #point.oxProps == 0 and #jobs > 0 then
+            point.oxProps = nil
+            point.oxRetryAt = GetGameTimer() + 2000
+        end
+    end)
+end
+
+-- Pre-escaped JSON literals (rarity per item), cached.
+local jsonStr
+
+---Full spawn (nothing on the ground yet).
+local function spawn(point)
+    if point.oxProps then return end
+
+    local entries, sig = entriesFor(point)
+
+    -- Hard cap on props alive on this client: try again in 2 s.
+    if trackedCount + pendingCount + #entries > MAX_TOTAL_PROPS then
+        point.oxRetryAt = GetGameTimer() + 2000
+        return
+    end
+
+    point.oxProps = {}
+    point.oxPropMeta = {}
+    point.oxSig = sig
+    point.oxGen = (point.oxGen or 0) + 1
+    ensureAnchor(point)
+    scanDirty = true
+
+    local jobs = {}
+    for i = 1, #entries do
+        entries[i].rarityJson = jsonStr(entries[i].name and rarityMap[entries[i].name] or '')
+        jobs[i] = { entry = entries[i], index = i }
+    end
+
+    createProps(point, jobs, point.oxGen, #entries)
+end
+
+---Incremental update: props whose item is still in the drop stay exactly
+---where they lie, props of taken items are deleted, new items get new props.
+local function reconcile(point)
+    if not point.oxProps then return spawn(point) end
+
+    local entries, sig = entriesFor(point)
+    if sig == point.oxSig then
+        -- same set: refresh bag contents (names may differ) and leave it
+        for _, meta in pairs(point.oxPropMeta or {}) do
+            if meta.bag then
+                for i = 1, #entries do
+                    if entries[i].bag then meta.names = entries[i].names end
+                end
+            end
+        end
+
+        return
+    end
+
+    point.oxSig = sig
+    scanDirty = true
+
+    local wanted = {}
+    for i = 1, #entries do
+        local key = entries[i].key or ('idx#%d'):format(i)
+        entries[i].key = key
+        entries[i].rarityJson = jsonStr(entries[i].name and rarityMap[entries[i].name] or '')
+        wanted[key] = { entry = entries[i], index = i }
+    end
+
+    -- delete what is gone, keep what stays
+    local keep, keepMeta = {}, {}
+    local have = {}
+
+    for i = 1, #(point.oxProps or {}) do
+        local obj = point.oxProps[i]
+        local meta = point.oxPropMeta and point.oxPropMeta[obj]
+        local w = meta and wanted[meta.key]
+
+        if w and w.entry.model == meta.model and DoesEntityExist(obj) then
+            keep[#keep + 1] = obj
+            w.entry.id = meta.id or (point.invId .. '#' .. meta.key)
+            keepMeta[obj] = w.entry
+            have[meta.key] = true
+        else
+            deleteProp(obj)
+        end
+    end
+
+    point.oxProps = keep
+    point.oxPropMeta = keepMeta
+
+    -- spawn only the missing entries (never with the fresh toss)
+    local jobs = {}
+    for i = 1, #entries do
+        if not have[entries[i].key] then jobs[#jobs + 1] = { entry = entries[i], index = i } end
+    end
+
+    -- A new generation on EVERY change, jobs or not: a createProps thread
+    -- still settling an entry that was just taken would otherwise finish
+    -- into the current generation and leave a ghost prop behind.
+    point.oxGen = (point.oxGen or 0) + 1
+
+    if #jobs > 0 then
+        if trackedCount + pendingCount + #jobs > MAX_TOTAL_PROPS then
+            -- over the cap: keep what lies there, retry the rest later
+            point.oxSig = nil
+            point.oxRetryAt = GetGameTimer() + 2000
+            return
+        end
+        point.oxFresh = false
+        createProps(point, jobs, point.oxGen, #entries)
+    elseif #keep == 0 then
+        point.oxProps = nil
+    end
+end
+
+local function inInstance(point)
+    return not point.instance or point.instance == client.player:get('instance')
+end
+
+local function forget(point)
+    if activePoints[point] then
+        activePoints[point] = nil
+        activeCount -= 1
+    end
+
+    despawn(point)
+end
+
+-- ─── JSON strings, built by hand ────────────────────────────
+--
+--  The prompt feed is the only thing this module does per frame, and
+--  `SendNUIMessage(table)` runs a pure-Lua json.encode over a nested
+--  table every time. The feed is instead assembled from pre-escaped
+--  fragments and handed to the raw native, which only validates it.
+local jsonEsc = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+local jsonCache = {}
+local jsonCacheSize = 0
+
+---@param s string
+---@return string quoted JSON string literal
+function jsonStr(s)
+    local c = jsonCache[s]
+    if c then return c end
+
+    c = '"' .. (s:gsub('[%c"\\]', function(ch)
+        return jsonEsc[ch] or ('\\u%04x'):format(ch:byte())
+    end)) .. '"'
+
+    if jsonCacheSize >= 4096 then
+        jsonCache = {}
+        jsonCacheSize = 0
+    end
+
+    jsonCache[s] = c
+    jsonCacheSize = jsonCacheSize + 1
+
+    return c
+end
+
+-- ─── prompt loop ────────────────────────────────────────────
+local SLOW_MS = 250
+local FAST_WAIT = 8
+-- Screen fractions are compared at 1/2500 (≈ 0.8 px at 1080p).
+local QUANT = 2500
+local LIVE_EVERY = 3
+local LIVE_HOT_MS = 800
+
+local visible = {}        -- slow-pass output, records reused in place
+local visibleN = 0
+local frameNo = 0
+local invOpen = false
+
+-- What the NUI currently shows. Flat parallel arrays: no per-frame tables.
+local sentN = 0
+local sentId, sentX, sentY, sentD, sentP, sentR = {}, {}, {}, {}, {}, {}
+local sentKey, sentLabel, sentCount, sentIcon, sentRarity
+
+-- Fast-pass work buffers.
+local curId, curX, curY, curD, curR = {}, {}, {}, {}, {}
+
+local primaryPoint
+local primaryObj
+local primaryLabel
+local primaryCount
+local primaryIcon
+local primaryRarity
+local primaryGen = -1
+local labelGen = 0
+
+local pickupKeybind
+local keyLabel = cfg.key
+
+local function refreshKeyLabel()
+    if pickupKeybind then
+        local ok, key = pcall(pickupKeybind.getCurrentKey, pickupKeybind)
+        if ok and type(key) == 'string' and key ~= '' then
+            keyLabel = key:upper()
+            return
+        end
+    end
+
+    keyLabel = cfg.key
+end
+
+---Label / count / icon / rarity of the prop the player is looking at.
+local function primaryInfo(point, obj)
+    local items = type(point.items) == 'table' and point.items or nil
+    local meta = obj and point.oxPropMeta and point.oxPropMeta[obj]
+
+    if meta and meta.name then
+        return Items[meta.name]?.label or meta.name, tonumber(items and items[meta.name]) or 1, meta.name, rarityMap[meta.name] or ''
+    end
+
+    if meta and meta.bag then
+        local n = #meta.names
+        local first = meta.names[1]
+        if n == 1 then
+            return Items[first]?.label or first, tonumber(items and items[first]) or 1, first, rarityMap[first] or ''
+        end
+        return nil, n, nil, ''
+    end
+
+    local names = items and sortedNames(items) or {}
+    local first = names[1]
+
+    return first and (Items[first]?.label or first) or nil, #names, nil, ''
+end
+
+-- Reused fragment buffer for the NUI JSON.
+local frag = {}
+
+---Hand the NUI exactly what the `sent*` buffers hold.
+local function push()
+    local keyJson = jsonStr(sentKey or cfg.key)
+
+    for i = 1, sentN do
+        if sentP[i] then
+            frag[i] = ('{"id":%s,"x":%.4f,"y":%.4f,"dist":%.1f,"primary":true,"label":%s,"count":%d,"rarity":%s,"icon":%s}'):format(
+                jsonStr(sentId[i]), sentX[i] / QUANT, sentY[i] / QUANT, sentD[i] / 10,
+                sentLabel and jsonStr(sentLabel) or 'null', sentCount or 1,
+                jsonStr(sentRarity or ''), sentIcon and jsonStr(sentIcon) or 'null')
+        else
+            frag[i] = ('{"id":%s,"x":%.4f,"y":%.4f,"dist":%.1f,"primary":false,"rarity":%s}'):format(
+                jsonStr(sentId[i]), sentX[i] / QUANT, sentY[i] / QUANT, sentD[i] / 10, sentR[i] or '""')
+        end
+    end
+
+    for i = #frag, sentN + 1, -1 do frag[i] = nil end
+
+    SendNuiMessage('{"action":"oxlynDropsPrompts","data":{"key":' .. keyJson .. ',"prompts":[' .. table.concat(frag, ',') .. ']}}')
+end
+
+local function clearSent()
+    if sentN == 0 then return end
+
+    sentN = 0
+    sentLabel, sentCount, sentIcon, sentRarity = nil, nil, nil, nil
+    primaryPoint, primaryObj = nil, nil
+    SendNuiMessage('{"action":"oxlynDropsClear"}')
+end
+
+local function newRecord(n)
+    local v = visible[n]
+    if not v then
+        v = { hot = 0 }
+        visible[n] = v
+    end
+    return v
+end
+
+---Slow pass: what exists, what needs spawning, what is worth drawing.
+local function scan(now, coords, instance)
+    visibleN = 0
+
+    for point in pairs(activePoints) do
+        -- Point replaced / removed behind our back (instance swap
+        -- re-creates points, a logout wipes the registry).
+        if not client.drops or client.drops[point.invId] ~= point then
+            forget(point)
+            goto continue
+        end
+
+        if point.instance and point.instance ~= instance then
+            if point.oxProps then despawn(point) end
+            goto continue
+        end
+
+        local pcoords = point.coords
+        local dist = #(coords - pcoords)
+
+        if not point.oxProps and dist <= RENDER_DISTANCE and now >= (point.oxRetryAt or 0) then
+            spawn(point)
+        end
+
+        -- Marker 'none': only the props that can become the primary are
+        -- worth projecting at all.
+        local drawLimit = MARKER_NONE and (PROMPT_DISTANCE + SCATTER_RADIUS + 1.0) or RING_DISTANCE
+
+        if dist <= drawLimit then
+            local props = point.oxProps
+            local n = props and #props or 0
+
+            if n == 0 then
+                -- props still streaming: one marker on the ground anchor
+                local a = ensureAnchor(point)
+                visibleN = visibleN + 1
+                local v = newRecord(visibleN)
+                v.point, v.obj, v.id, v.live, v.centre, v.rj = point, nil, point.invId, false, false, '""'
+                v.cx, v.cy, v.cz = a.x, a.y, a.z
+                v.d2 = dist * dist
+            else
+                local metas = point.oxPropMeta
+
+                for i = 1, n do
+                    local obj = props[i]
+
+                    if DoesEntityExist(obj) then
+                        local meta = metas and metas[obj]
+                        local model = meta and meta.model or 0
+                        local pc = propCentre(obj, model)
+
+                        -- A live physics prop that fell through the map or
+                        -- rolled away from its drop comes back to the anchor.
+                        local rdx, rdy = pc.x - pcoords.x, pc.y - pcoords.y
+
+                        if LIVE_PROPS and (pc.z < pcoords.z - 4.0 or math.sqrt(rdx * rdx + rdy * rdy) > SCATTER_RADIUS + 4.0) then
+                            local a = ensureAnchor(point)
+                            SetEntityCoordsNoOffset(obj, a.x, a.y, a.z + 0.2, false, false, false)
+                            SetEntityVelocity(obj, 0.0, 0.0, 0.0)
+                            pc = propCentre(obj, model)
+                        end
+
+                        visibleN = visibleN + 1
+                        local v = newRecord(visibleN)
+                        if v.obj == obj and (v.cx ~= pc.x or v.cy ~= pc.y or v.cz ~= pc.z) then v.hot = now + LIVE_HOT_MS end
+                        v.point, v.obj = point, obj
+                        v.id = meta and meta.id or (point.invId .. '#' .. i)
+                        v.live = LIVE_PROPS
+                        v.centre = centreOffset(model)
+                        v.cx, v.cy, v.cz = pc.x, pc.y, pc.z
+                        v.rj = meta and meta.rarityJson or '""'
+                        local dx, dy, dz = coords.x - pc.x, coords.y - pc.y, coords.z - pc.z
+                        v.d2 = dx * dx + dy * dy + dz * dz
+                    end
+                end
+            end
+        end
+
+        ::continue::
+    end
+
+    -- More props than the NUI may draw: keep the nearest (in-place
+    -- insertion sort over ≤ 48 records, then truncate).
+    if visibleN > MAX_PROMPTS then
+        for i = 2, visibleN do
+            local v = visible[i]
+            local j = i - 1
+            while j >= 1 and visible[j].d2 > v.d2 do
+                visible[j + 1] = visible[j]
+                j = j - 1
+            end
+            visible[j + 1] = v
+        end
+
+        for i = MAX_PROMPTS + 1, visibleN do
+            local v = visible[i]
+            v.point, v.obj, v.centre = nil, nil, false
+        end
+
+        visibleN = MAX_PROMPTS
+    end
+
+    -- Drop stale references so a forgotten point can be collected.
+    for i = #visible, visibleN + 1, -1 do
+        local v = visible[i]
+        v.point, v.obj, v.centre = nil, nil, false
+    end
+end
+
+---Fast pass: project `visible` and feed the NUI if anything moved.
+local function render(now, coords)
+    local n = 0
+    local nearest, nearestObj, nearestScore, nearestIdx
+    local px, py, pz = coords.x, coords.y, coords.z
+
+    frameNo = frameNo + 1
+
+    for i = 1, visibleN do
+        local v = visible[i]
+        local x, y, z = v.cx, v.cy, v.cz
+
+        -- Still dynamic: read where it is right now — every pass while it
+        -- was recently seen moving, otherwise staggered across passes.
+        if v.live and (now < v.hot or (frameNo + i) % LIVE_EVERY == 0) then
+            local c = v.centre
+            local pc = c and GetOffsetFromEntityInWorldCoords(v.obj, c.x, c.y, c.z) or GetEntityCoords(v.obj)
+            local nx, ny, nz = pc.x, pc.y, pc.z
+
+            if nx ~= x or ny ~= y or nz ~= z then
+                v.hot = now + LIVE_HOT_MS
+                x, y, z = nx, ny, nz
+                v.cx, v.cy, v.cz = x, y, z
+            end
+        end
+
+        local onScreen, sx, sy = GetScreenCoordFromWorldCoord(x, y, z)
+
+        if onScreen then
+            local dx, dy, dz = px - x, py - y, pz - z
+            local pdist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            n = n + 1
+            curId[n] = v.id
+            curX[n] = math.floor(sx * QUANT + 0.5)
+            curY[n] = math.floor(sy * QUANT + 0.5)
+            curD[n] = math.floor(pdist * 10 + 0.5)
+            curR[n] = v.rj
+
+            -- The PRIMARY is the candidate inside promptDistance whose marker
+            -- sits closest to the centre of the screen. Distance breaks ties.
+            if pdist <= PROMPT_DISTANCE then
+                local ex, ey = (sx - 0.5) * 1.78, sy - 0.5
+                local score = ex * ex + ey * ey + pdist * 0.01
+
+                if not nearestScore or score < nearestScore then
+                    nearest, nearestObj, nearestScore, nearestIdx = v.point, v.obj, score, n
+                end
+            end
+        end
+    end
+
+    if nearest then
+        if nearest ~= primaryPoint or nearestObj ~= primaryObj or primaryGen ~= labelGen then
+            primaryLabel, primaryCount, primaryIcon, primaryRarity = primaryInfo(nearest, nearestObj)
+            primaryCount = math.floor(tonumber(primaryCount) or 1)
+            primaryGen = labelGen
+        end
+    else
+        primaryLabel, primaryCount, primaryIcon, primaryRarity = nil, nil, nil, nil
+    end
+
+    primaryPoint, primaryObj = nearest, nearestObj
+
+    local changed = n ~= sentN or keyLabel ~= sentKey or primaryLabel ~= sentLabel or primaryCount ~= sentCount
+        or primaryIcon ~= sentIcon or primaryRarity ~= sentRarity
+
+    if not changed then
+        for i = 1, n do
+            if curId[i] ~= sentId[i] or curX[i] ~= sentX[i] or curY[i] ~= sentY[i] or curD[i] ~= sentD[i]
+                or (i == nearestIdx) ~= sentP[i] then
+                changed = true
+                break
+            end
+        end
+    end
+
+    if not changed then return end
+
+    for i = 1, n do
+        sentId[i], sentX[i], sentY[i], sentD[i], sentP[i], sentR[i] = curId[i], curX[i], curY[i], curD[i], i == nearestIdx, curR[i]
+    end
+
+    sentN = n
+    sentKey = keyLabel
+    sentLabel, sentCount, sentIcon, sentRarity = primaryLabel, primaryCount, primaryIcon, primaryRarity
+
+    push()
+end
+
+local function uiBlocked()
+    return client.player:get('invOpen') == true or client.player:get('invEditor') == true or IsNuiFocused()
+end
+
+local function runLoop()
+    if loopRunning then return end
+    loopRunning = true
+
+    CreateThread(function()
+        local lastScan = 0
+        local lastKey = 0
+
+        while activeCount > 0 do
+            local now = GetGameTimer()
+            local coords = GetEntityCoords(cache.ped)
+
+            if scanDirty or now - lastScan >= SLOW_MS then
+                scanDirty = false
+                lastScan = now
+                invOpen = client.player:get('invOpen') == true
+                scan(now, coords, client.player:get('instance'))
+            end
+
+            if visibleN == 0 then
+                clearSent()
+                Wait(SLOW_MS)
+            elseif invOpen or uiBlocked() then
+                -- inventory / editor / another UI open: no markers, but come back quickly
+                clearSent()
+                invOpen = client.player:get('invOpen') == true
+                Wait(50)
+            else
+                if now - lastKey >= 1000 then
+                    lastKey = now
+                    refreshKeyLabel()
+                end
+
+                render(now, coords)
+                Wait(FAST_WAIT)
+            end
+        end
+
+        loopRunning = false
+        clearSent()
+    end)
+end
+
+-- ─── prop lifecycle (hooked on the inventory's drop points) ─
+
+---Drop point entered `renderDistance`.
+---@param point table CPoint
+function RWDrops.onEnter(point)
+    if not RWDrops.enabled then return end
+    if not client.drops or client.drops[point.invId] ~= point then return end -- zombie point
+
+    -- Physics only for drops created just now (the player saw them fall);
+    -- drops streamed in later are placed statically.
+    if point.oxFresh == nil then
+        point.oxFresh = (not cfg.dropInFrontPhysicsOnly) or (GetGameTimer() - (point.oxCreated or 0)) < 1500
+    end
+
+    if not activePoints[point] then
+        activePoints[point] = true
+        activeCount += 1
+    end
+
+    ensureAnchor(point)
+    scanDirty = true
+
+    if inInstance(point) then spawn(point) end
+
+    runLoop()
+end
+
+---Drop point left `renderDistance` (or was removed).
+---@param point table CPoint
+function RWDrops.onExit(point)
+    forget(point)
+end
+
+---Drop removed / point about to be re-created — same as exit; idempotent.
+RWDrops.remove = RWDrops.onExit
+
+---Delete every prop and reset the prompt (logout / resource stop / rebuild).
+function RWDrops.clearAll()
+    for point in pairs(activePoints) do
+        despawn(point)
+    end
+
+    activePoints = {}
+    activeCount = 0
+    visibleN = 0
+    scanDirty = true
+
+    clearSent()
+end
+
+-- ─── server → client: item set of a drop changed ────────────
+---@param dropId string
+---@param items table<string, number>
+function RWDrops.updateDropItems(dropId, items)
+    local point = client.drops and client.drops[dropId]
+    if not point or type(items) ~= 'table' then return end
+
+    point.items = items
+    labelGen = labelGen + 1
+
+    if not RWDrops.enabled then return end
+
+    if not point.oxProps then
+        if activePoints[point] and inInstance(point) then
+            point.oxRetryAt = 0
+            spawn(point)
+        end
+
+        return
+    end
+
+    if inInstance(point) then reconcile(point) end
+end
+
+RegisterNetEvent('ox_inventory:updateDropItems', RWDrops.updateDropItems)
+
+-- ─── pickup key ─────────────────────────────────────────────
+local lastPickup = 0
+
+function RWDrops.pickupPrimary()
+    if not RWDrops.enabled then return end
+
+    local point = primaryPoint
+    if not point then return end
+
+    local now = GetGameTimer()
+    if now - lastPickup < 300 then return end
+    lastPickup = now
+
+    -- The stash / shop / crafting marker wins on the same key press.
+    if Utils.MarkerPromptActive and Utils.MarkerPromptActive() then return end
+
+    local player = client.player
+    if player:get('invOpen') or player:get('invBusy') or PlayerData.dead or player:get('invEditor') or IsNuiFocused() then return end
+    if cache.vehicle or IsPedFalling(cache.ped) then return end
+    if not client.drops or client.drops[point.invId] ~= point then return end
+
+    local obj = primaryObj
+    local meta = obj and point.oxPropMeta and point.oxPropMeta[obj] or nil
+    local target = obj and DoesEntityExist(obj) and GetEntityCoords(obj) or point.coords
+
+    if #(GetEntityCoords(cache.ped) - target) > PROMPT_DISTANCE + 0.6 then return end
+
+    -- Which items this prop stands for (nil = everything in the drop).
+    local names
+    if meta and meta.name then
+        names = { meta.name }
+    elseif meta and meta.bag and #meta.names > 0 then
+        names = meta.names
+    end
+
+    local dropId = point.invId
+
+    if cfg.pickupMode == 'open' then
+        return client.openInventory('drop', { id = dropId })
+    end
+
+    local ped = cache.ped
+
+    if not IsPedRagdoll(ped) and not IsPedInParachuteFreeFall(ped) then
+        Utils.PlayAnim(0, 'pickup_object', 'pickup_low', 8.0, 2.0, 700, 48, 0.0, false, false, false)
+    end
+
+    -- ("false": the second argument is ox_lib's per-event cooldown, and a
+    -- second press inside it answered nil, which fell through to opening
+    -- the drop; the server throttles pickups itself)
+    local ok, taken, leftCount = lib.callback.await('ox_inventory:rwDropsPickup', false, dropId, names)
+
+    -- nil = timeout / server error: not "nothing fitted"
+    if ok == nil then return end
+
+    if ok then
+        if names == nil and (leftCount or 0) == 0 then
+            forget(point)
+        else
+            -- The server's updateDropItems (sent before this reply) holds the
+            -- truth; only a name taken in full may go locally: a partial
+            -- pickup leaves the rest of that stack on the ground.
+            if names and type(point.items) == 'table' and (leftCount or 0) == 0 then
+                for i = 1, #names do point.items[names[i]] = nil end
+            end
+
+            labelGen = labelGen + 1
+            reconcile(point)
+        end
+
+        if (leftCount or 0) > 0 then
+            lib.notify({ type = 'inform', description = locale('ui.drops.cannot_carry') })
+        end
+
+        return
+    end
+
+    if taken == 'busy' or taken == 'disabled' or taken == 'far' then return end
+
+    -- Nothing fitted: open the drop so the player can choose.
+    client.openInventory('drop', { id = dropId })
+end
+
+pickupKeybind = lib.addKeybind({
+    name = 'rw_pickupdrop',
+    description = locale('ui.drops.keybind'),
+    defaultKey = cfg.key,
+    onPressed = RWDrops.pickupPrimary,
+})
+
+-- Plain command alias so external binds / macros can trigger it too.
+RegisterCommand('ox_inventory:pickupDrop', RWDrops.pickupPrimary, false)
+
+---@return string? dropId, string? propKey
+function RWDrops.getPrimary()
+    local point = primaryPoint
+    if not point then return nil end
+    local meta = primaryObj and point.oxPropMeta and point.oxPropMeta[primaryObj]
+    return point.invId, meta and meta.key or nil
+end
+
+-- ─── config (server default + admin edits) ──────────────────
+---Tell the NUI which look ground drops have (Settings › Ground drops).
+local function pushState()
+    SendNUIMessage({ action = 'oxlynDropsState', data = { enabled = RWDrops.enabled, feature = true } })
+end
+
+---@param raw table
+---@param enabled boolean
+---@param dropItems? table<string, table<string, number>> fresh item maps (sent when item props come back on:
+---  the server does not sync them while drops are classic bags)
+function RWDrops.applyConfig(raw, enabled, dropItems)
+    if type(dropItems) == 'table' and client.drops then
+        for dropId, items in pairs(dropItems) do
+            local point = client.drops[dropId]
+            if point and type(items) == 'table' then point.items = items end
+        end
+        labelGen = labelGen + 1
+    end
+
+    local new = Shared.sanitizeDropsConfig(raw)
+    local old = cfg
+
+    local enabledChanged = (RWDrops.featureOn and enabled == true) ~= RWDrops.enabled
+    local distanceChanged = new.renderDistance ~= old.renderDistance
+    local spawnChanged = false
+
+    for _, k in ipairs(Shared.SPAWN_KEYS) do
+        if k == 'weaponRotation' then
+            if new.weaponRotation.pitch ~= old.weaponRotation.pitch or new.weaponRotation.roll ~= old.weaponRotation.roll then spawnChanged = true end
+        elseif new[k] ~= old[k] then
+            spawnChanged = true
+        end
+    end
+
+    local wipeResolved = new.weaponProps ~= old.weaponProps or new.bagModel ~= old.bagModel
+
+    cfg = new
+    RWDrops.config = cfg
+    RWDrops.renderDistance = cfg.renderDistance
+    RENDER_DISTANCE, RING_DISTANCE, PROMPT_DISTANCE, SCATTER_RADIUS = cfg.renderDistance, cfg.ringDistance, cfg.promptDistance, cfg.scatterRadius
+    LIVE_PROPS = cfg.physics and cfg.keepPhysics
+    MAX_PROMPTS, MAX_TOTAL_PROPS = cfg.maxPrompts, cfg.maxTotalProps
+    recomputeFallback()
+    if wipeResolved then resolved = {} end
+
+    RWDrops.enabled = RWDrops.featureOn and enabled == true
+    pushState()
+
+    -- The look switched (item props <-> classic bag) or the radius changed:
+    -- every point is re-created in the current look — drops already on the
+    -- ground included. clearAll first, so no prop outlives the switch.
+    if enabledChanged or distanceChanged then
+        RWDrops.clearAll()
+
+        if client.recreateDrop and client.drops then
+            local ids = {}
+            for id in pairs(client.drops) do ids[#ids + 1] = id end
+            for i = 1, #ids do client.recreateDrop(ids[i]) end
+        end
+    elseif spawnChanged then
+        for point in pairs(activePoints) do
+            despawn(point)
+            point.oxRetryAt = 0
+        end
+        scanDirty = true
+    end
+end
+
+RegisterNetEvent('ox_inventory:rwDropsConfig', function(data)
+    if type(data) ~= 'table' then return end
+    RWDrops.applyConfig(data.config, data.enabled, data.dropItems)
+end)
+-- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+RegisterNetEvent('ox_inventory:oxlynDropsConfig', function(data)
+    if type(data) ~= 'table' then return end
+    RWDrops.applyConfig(data.config, data.enabled, data.dropItems)
+end)
+
+-- ─── prop map (versioned, from the server) ──────────────────
+---@param payload { version: number, defaults?: table, items: table }
+function RWDrops.applyPropMap(payload)
+    if type(payload) ~= 'table' or type(payload.items) ~= 'table' then return end
+
+    local version = tonumber(payload.version) or 0
+    if version <= propMapVersion and propMapVersion > 0 then return end
+
+    propMapVersion = version
+    propMap = {}
+
+    for name, raw in pairs(payload.items) do
+        local entry = Shared.normalizeEntry(raw)
+        if entry then propMap[name] = entry end
+    end
+
+    if type(payload.defaults) == 'table' and type(payload.defaults.bagModel) == 'string' then
+        propMapDefaults.bagModel = payload.defaults.bagModel
+    end
+
+    resolved = {}
+    modelCentre = {}
+    recomputeFallback()
+
+    for point in pairs(activePoints) do
+        if point.oxProps and inInstance(point) then
+            reconcile(point)
+        end
+    end
+end
+
+RegisterNetEvent('ox_inventory:rwDropsPropMap', RWDrops.applyPropMap)
+-- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+RegisterNetEvent('ox_inventory:oxlynDropsPropMap', RWDrops.applyPropMap)
+
+-- ─── NUI → Lua ──────────────────────────────────────────────
+---@param marker string
+function RWDrops.setMarker(marker)
+    MARKER_NONE = marker == 'none'
+    scanDirty = true
+end
+
+RegisterNUICallback('rwDropsMarker', function(data, cb)
+    cb(1)
+    if type(data) == 'table' then RWDrops.setMarker(data.marker) end
+end)
+-- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+RegisterNUICallback('oxlynDropsMarker', function(data, cb)
+    cb(1)
+    if type(data) == 'table' then RWDrops.setMarker(data.marker) end
+end)
+
+RegisterNUICallback('rwDropsState', function(_, cb)
+    cb({ enabled = RWDrops.enabled, feature = true, key = keyLabel })
+end)
+-- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+RegisterNUICallback('oxlynDropsState', function(_, cb)
+    cb({ enabled = RWDrops.enabled, feature = true, key = keyLabel })
+end)
+
+-- ─── admin: model validation + 10 s preview (local object) ──
+local previewObj
+local previewTimer = 0
+
+local function deletePreview()
+    if previewObj then
+        local obj = previewObj
+        previewObj = nil
+        if DoesEntityExist(obj) then
+            SetEntityAsMissionEntity(obj, true, true)
+            DeleteObject(obj)
+        end
+    end
+end
+
+local function isAdminClient()
+    return client.rwIsAdmin == true
+end
+
+RegisterNUICallback('rwAdmin:propMapValidate', function(data, cb)
+    if not isAdminClient() then return cb({ ok = false, reason = 'no_access' }) end
+
+    local models = type(data) == 'table' and data.models or nil
+    local results = {}
+
+    if type(models) == 'table' then
+        for i = 1, math.min(#models, 32) do
+            local m = models[i]
+            if type(m) == 'string' and m:match('^[%w_]+$') then
+                local hash = joaat(m)
+                results[m] = IsModelInCdimage(hash) and IsModelValid(hash) or false
+            end
+        end
+    end
+
+    cb({ ok = true, results = results })
+end)
+-- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+RegisterNUICallback('oxlynAdmin:propMapValidate', function(data, cb)
+    if not isAdminClient() then return cb({ ok = false, reason = 'no_access' }) end
+
+    local models = type(data) == 'table' and data.models or nil
+    local results = {}
+
+    if type(models) == 'table' then
+        for i = 1, math.min(#models, 32) do
+            local m = models[i]
+            if type(m) == 'string' and m:match('^[%w_]+$') then
+                local hash = joaat(m)
+                results[m] = IsModelInCdimage(hash) and IsModelValid(hash) or false
+            end
+        end
+    end
+
+    cb({ ok = true, results = results })
+end)
+
+---@param entry table raw PropEntry
+---@param item string
+---@return boolean ok, string? reasonOrModel
+function RWDrops.preview(entry, item)
+    deletePreview()
+
+    entry = Shared.normalizeEntry(entry)
+    local hash, name
+    if entry then hash, name = firstValidModel(entry.model) end
+
+    if not hash then
+        SendNUIMessage({ action = 'oxlynDropsPreview', data = { active = false, item = item, valid = false, reason = 'invalid_model' } })
+        return false, 'invalid_model'
+    end
+
+    local target = GetOffsetFromEntityInWorldCoords(cache.ped, 0.0, 1.5, 0.0)
+    local ground = groundAt(target.x, target.y, target.z)
+    local o = { angle = 0.0, radius = 0.0, heading = GetEntityHeading(cache.ped), r1 = 0.5, r2 = 0.5, r3 = 0.5, r4 = 0.5, r5 = 0.5, r6 = 0.5 }
+    local physics = (entry.physics ~= false) and cfg.physics
+    local previewPoint = { invId = '__preview', coords = target, oxProps = {}, oxPropMeta = {}, oxGen = 1 }
+    local spawnEntry = { model = hash, weapon = name:sub(1, 2) == 'w_', offset = entry.offset, rotation = entry.rotation }
+    local token = GetGameTimer()
+    previewTimer = token
+
+    CreateThread(function()
+        local obj = spawnOne(previewPoint, spawnEntry, o, ground, 1, physics, physics)
+
+        if not obj then
+            SendNUIMessage({ action = 'oxlynDropsPreview', data = { active = false, item = item, model = name, valid = false, reason = 'spawn_failed' } })
+            return
+        end
+
+        -- The preview lives outside the drop registry: untrack it and keep
+        -- its own slot + timer.
+        if tracked[obj] ~= nil then
+            tracked[obj] = nil
+            trackedCount = trackedCount - 1
+        end
+
+        if previewTimer ~= token then
+            SetEntityAsMissionEntity(obj, true, true)
+            DeleteObject(obj)
+            return
+        end
+
+        previewObj = obj
+        SetTimeout(10000, function()
+            if previewTimer == token then deletePreview() end
+        end)
+    end)
+
+    SendNUIMessage({ action = 'oxlynDropsPreview', data = { active = true, item = item, model = name, valid = true } })
+    return true, name
+end
+
+RegisterNUICallback('rwAdmin:propMapPreview', function(data, cb)
+    if not isAdminClient() then return cb({ ok = false, reason = 'no_access' }) end
+
+    data = type(data) == 'table' and data or {}
+
+    if data.clear then
+        previewTimer = 0
+        deletePreview()
+        return cb({ ok = true, active = false })
+    end
+
+    local ok, res = RWDrops.preview(data.entry, data.item)
+
+    if ok then
+        cb({ ok = true, valid = true, model = res })
+    else
+        cb({ ok = true, valid = false, reason = res })
+    end
+end)
+-- Legacy alias (pre-rename name): the closed Creator app / external callers still use it.
+RegisterNUICallback('oxlynAdmin:propMapPreview', function(data, cb)
+    if not isAdminClient() then return cb({ ok = false, reason = 'no_access' }) end
+
+    data = type(data) == 'table' and data or {}
+
+    if data.clear then
+        previewTimer = 0
+        deletePreview()
+        return cb({ ok = true, active = false })
+    end
+
+    local ok, res = RWDrops.preview(data.entry, data.item)
+
+    if ok then
+        cb({ ok = true, valid = true, model = res })
+    else
+        cb({ ok = true, valid = false, reason = res })
+    end
+end)
+
+AddEventHandler('ox_inventory:closeInventory', function()
+    if previewObj then
+        previewTimer = 0
+        deletePreview()
+    end
+end)
+
+-- ─── first sync with the server ─────────────────────────────
+CreateThread(function()
+    while not PlayerData or not PlayerData.loaded do Wait(250) end
+
+    for _ = 1, 5 do
+        -- ("false": a 3000 ms cooldown made every other retry a silent nil)
+        local data = lib.callback.await('ox_inventory:rwDropsSync', false)
+
+        if type(data) == 'table' then
+            if type(data.propMap) == 'table' then RWDrops.applyPropMap(data.propMap) end
+            RWDrops.applyConfig(data.config, data.enabled)
+            return
+        end
+
+        Wait(2000)
+    end
+end)
+
+-- ─── cleanup ────────────────────────────────────────────────
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= cache.resource then return end
+    previewTimer = 0
+    deletePreview()
+    RWDrops.clearAll()
+end)
+
+exports('getDropConfig', function() return cfg end)
+
+---Diagnostics (harness): props alive, props reserved by running spawns, active points.
+function RWDrops.stats()
+    return trackedCount, pendingCount, activeCount
+end
+
+return RWDrops

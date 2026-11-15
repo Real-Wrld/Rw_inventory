@@ -1,0 +1,1402 @@
+if not lib then return end
+
+-- ═════════════════════════════════════════════════════════════
+--  REALWRLD Software® · ox_inventory Redesign
+--  Shop basket checkout  ·  optional (RWInv.Shop)
+-- ═════════════════════════════════════════════════════════════
+--
+--  Stock ox_inventory buys ONE shop slot into ONE player slot per
+--  call (`ox_inventory:buyItem`), paid for with the currency ITEM in
+--  the player's inventory. There is no bank, and a multi-item purchase
+--  is N independent transactions that can half-succeed.
+--
+--  This module adds a single atomic checkout for a whole basket:
+--
+--      ox_inventory:rwShopBuy { items = { { slot, count }, … },
+--                                  payment = 'cash' | 'bank' }
+--
+--  Everything is validated BEFORE anything moves — stock, licence,
+--  job grade, weight, free slots and the money — and the money is
+--  taken before the items are handed over. If any hand-over still
+--  fails, the whole basket is rolled back and the player is refunded,
+--  so a checkout is all-or-nothing.
+--
+--  The UI never decides what anything costs. It sends slot numbers and
+--  counts; prices, stock and balances are read here.
+--
+--  `ox_inventory:buyItem` is left completely untouched: the classic
+--  drag-and-drop path and any third-party resource that calls it keep
+--  working, and `RWInv.Shop.mode = 'classic'` turns this off.
+-- ═════════════════════════════════════════════════════════════
+
+local Items = require 'modules.items.server'
+local Inventory = require 'modules.inventory.server'
+local TriggerEventHooks = require 'modules.hooks.server'
+
+-- The rw basket code below expects the newer hooks contract (a table with
+-- .success and an optional __close). This server's modules/hooks/server.lua
+-- returns a plain boolean (true / false), so `hooks.success` crashed with
+-- "attempt to index a boolean value". Normalise both shapes to a table.
+local function runEventHooks(event, payload)
+    local result = TriggerEventHooks(event, payload)
+
+    if type(result) == 'table' then return result end
+
+    return { success = result ~= false }
+end
+local config = require 'modules.rwconfig.shared'.Get()
+
+local shopCfg = type(config.Shop) == 'table' and config.Shop or {}
+
+local MODE         = shopCfg.mode == 'classic' and 'classic' or 'basket'
+local ALLOW_CASH   = shopCfg.cash ~= false
+local ALLOW_BANK   = shopCfg.bank ~= false
+local BANK_ACCOUNT = type(shopCfg.bankAccount) == 'string' and shopCfg.bankAccount ~= '' and shopCfg.bankAccount or 'bank'
+local MAX_PER_LINE = math.floor(tonumber(shopCfg.maxPerLine) or 100)
+local MAX_LINES    = 50
+-- Presentation only: the server still accepts any count within the caps
+-- above, whether or not the UI draws a stepper.
+local SHOW_QUANTITY = shopCfg.quantity ~= false
+
+-- A shop can price items in any item ("markedbills", casino chips …).
+-- The bank only holds ordinary money, so a basket that contains any
+-- other currency can only be paid from the inventory.
+local BANK_CURRENCY = 'money'
+
+if MAX_PER_LINE < 1 then MAX_PER_LINE = 1 end
+if not ALLOW_CASH and not ALLOW_BANK then ALLOW_CASH = true end
+
+-- ── V3 · selling (RWInv.Shop.sell) ────────────────────────
+local sellCfg         = type(shopCfg.sell) == 'table' and shopCfg.sell or {}
+local SELL_ENABLED    = sellCfg.enabled == true
+local SELL_RATE       = math.min(1, math.max(0, tonumber(sellCfg.rate) or 0.5))
+local SELL_PAY_TO     = sellCfg.payTo == 'bank' and 'bank' or 'cash'
+local SELL_RESTOCK    = sellCfg.restock ~= false
+local SELL_DURABILITY = sellCfg.durabilityScaled ~= false
+local GetLocks        = require 'modules.locks'
+-- Logs module (WP3) is optional: `server.Log` is read lazily at call time.
+
+---The admin-editable server settings (modules/rwserversettings) win
+---over config.lua at call time; without that module the config value
+---stands. The values above are the config fallbacks.
+---@param path string
+---@param fallback any
+local function setting(path, fallback)
+    local S = server and server.RWSettings
+
+    if S and S.get then
+        local v = S.get(path)
+
+        if v ~= nil then return v end
+    end
+
+    return fallback
+end
+
+local function sellEnabled() return setting('shop.sellEnabled', SELL_ENABLED) == true end
+local function sellPayTo() return setting('shop.sellPayTo', SELL_PAY_TO) == 'bank' and 'bank' or 'cash' end
+local function sellDurability() return setting('shop.sellDurabilityScaled', SELL_DURABILITY) ~= false end
+local function clampRate(v, fallback) return math.min(1, math.max(0, tonumber(v) or fallback)) end
+local function sellRate(shop)
+    local base = clampRate(setting('shop.sellRate', SELL_RATE), SELL_RATE)
+
+    if shop and shop.sellRate ~= nil then return clampRate(shop.sellRate, base) end
+
+    return base
+end
+
+---A whole, finite number from the NUI, or nil for anything else. NaN
+---passed every `< 1` / `> max` clamp below (each comparison with NaN is
+---false) and then flowed into counts, prices and inventory weights.
+---@param v any
+---@return integer?
+local function wholeNumber(v)
+    v = tonumber(v)
+
+    if not v or v ~= v or v == math.huge or v == -math.huge then return end
+
+    return math.floor(v)
+end
+
+---Clone of the player's slots + weight, so a half-failed checkout can be
+---put back exactly (items AND cash) instead of removing "what we think we
+---added" by name and metadata, which stopped matching as soon as AddItem
+---generated a serial or a container id and then quietly kept the item.
+---@param inv OxInventory
+local function snapshotItems(inv)
+    local items = {}
+
+    for k, v in pairs(inv.items) do items[k] = lib.table.deepclone(v) end
+
+    return { items = items, weight = inv.weight }
+end
+
+---@param inv OxInventory
+---@param snap table
+local function restoreItems(inv, snap)
+    local touched = {}
+
+    for k in pairs(inv.items) do touched[k] = true end
+    for k in pairs(snap.items) do touched[k] = true end
+
+    inv.items = snap.items
+    inv.weight = snap.weight
+    inv.changed = true
+
+    if inv.syncSlotsWithClients then
+        local slots = {}
+
+        for k in pairs(touched) do
+            slots[#slots + 1] = { item = inv.items[k] or { slot = k }, inventory = inv.id }
+        end
+
+        inv:syncSlotsWithClients(slots, true)
+    end
+
+    if server.syncInventory then server.syncInventory(inv) end
+end
+
+-- ═════════════════════════════════════════════════════════════
+--  Bank bridge
+-- ═════════════════════════════════════════════════════════════
+--  `shared.framework` is set from the `inventory:framework` convar and
+--  is the same value ox_inventory uses to pick modules/bridge/<fw>, so
+--  there is nothing to detect here.
+--
+--  Every provider returns:
+--    balance(src) -> number | nil      nil = no bank for this player
+--    charge(src, amount, reason) -> boolean   true ONLY if the money
+--                                             really left the account
+--
+--  Everything runs inside pcall: a framework that is missing, still
+--  booting, or has renamed a method degrades to "no bank" (the button
+--  disappears) instead of erroring on a purchase.
+-- ═════════════════════════════════════════════════════════════
+
+--  A WARNING WORTH READING BEFORE EDITING ANY OF THIS:
+--  only ox_core refuses to overdraw. ESX and ND_Core subtract without
+--  checking the balance at all, and qb-core / qbx_core allow `bank` to
+--  go negative on purpose (it is not in their `DontAllowMinus` list).
+--  So `bankCharge` below ALWAYS reads the balance and refuses the sale
+--  itself — never rely on the framework to say no. ESX additionally
+--  raises a Lua error on a bad account name or amount, hence the pcall
+--  around every provider call.
+
+local bankProviders = {}
+
+bankProviders.esx = {
+    balance = function(src)
+        local xPlayer = server.GetPlayerFromId and server.GetPlayerFromId(src)
+        if not xPlayer or not xPlayer.getAccount then return end
+
+        local account = xPlayer.getAccount(BANK_ACCOUNT)
+
+        return account and tonumber(account.money) or nil
+    end,
+
+    charge = function(src, amount, reason)
+        local xPlayer = server.GetPlayerFromId and server.GetPlayerFromId(src)
+        if not xPlayer or not xPlayer.removeAccountMoney then return false end
+
+        local account = xPlayer.getAccount(BANK_ACCOUNT)
+
+        if not account then return false end
+
+        -- `getAccount` hands back the LIVE account table, so the old
+        -- balance has to be copied out as a number. Holding the table
+        -- and reading `.money` again after the charge compares the new
+        -- balance with itself, which reads as "the charge failed" and
+        -- refunds a player who was correctly debited.
+        local before = tonumber(account.money) or 0
+
+        if before < amount then return false end
+
+        -- removeAccountMoney returns nothing, so success is confirmed
+        -- by re-reading the balance.
+        xPlayer.removeAccountMoney(BANK_ACCOUNT, amount, reason)
+
+        local after = xPlayer.getAccount(BANK_ACCOUNT)
+
+        return after ~= nil and (tonumber(after.money) or 0) <= before - amount
+    end,
+
+    credit = function(src, amount, reason)
+        local xPlayer = server.GetPlayerFromId and server.GetPlayerFromId(src)
+        if not xPlayer or not xPlayer.addAccountMoney then return false end
+
+        local account = xPlayer.getAccount(BANK_ACCOUNT)
+        if not account then return false end
+
+        local before = tonumber(account.money) or 0
+        xPlayer.addAccountMoney(BANK_ACCOUNT, amount, reason)
+
+        local after = xPlayer.getAccount(BANK_ACCOUNT)
+        return after ~= nil and (tonumber(after.money) or 0) >= before + amount
+    end,
+}
+
+do
+    -- `exports['qb-core']:GetCoreObject()` copies the framework's whole
+    -- object graph across the resource boundary on every call — it cost
+    -- ~367 ms a call on a populated server when the admin module used to
+    -- do it per request. Resolved once, reused forever.
+    local QBCore
+
+    local function qbCore()
+        if QBCore then return QBCore end
+
+        local ok, core = pcall(function() return exports['qb-core']:GetCoreObject() end)
+
+        if ok and type(core) == 'table' then QBCore = core end
+
+        return QBCore
+    end
+
+    bankProviders.qb = {
+        balance = function(src)
+            local core = qbCore()
+            local player = core and core.Functions.GetPlayer(src)
+
+            if not player then return end
+
+            return tonumber(player.Functions.GetMoney(BANK_ACCOUNT)) or nil
+        end,
+
+        charge = function(src, amount, reason)
+            local core = qbCore()
+            local player = core and core.Functions.GetPlayer(src)
+
+            if not player or not player.Functions.RemoveMoney then return false end
+            if (tonumber(player.Functions.GetMoney(BANK_ACCOUNT)) or 0) < amount then return false end
+
+            return player.Functions.RemoveMoney(BANK_ACCOUNT, amount, reason) == true
+        end,
+
+        credit = function(src, amount, reason)
+            local core = qbCore()
+            local player = core and core.Functions.GetPlayer(src)
+
+            if not player or not player.Functions.AddMoney then return false end
+
+            return player.Functions.AddMoney(BANK_ACCOUNT, amount, reason) == true
+        end,
+    }
+
+    -- Only these three names are read off the qbx_core export. That
+    -- matters: `exports.qbx_core` is a proxy that raises on any key it
+    -- does not export, so a hopeful `.Functions` would kill the thread.
+    bankProviders.qbx = {
+        balance = function(src)
+            if not exports.qbx_core:GetPlayer(src) then return end
+
+            return tonumber(exports.qbx_core:GetMoney(src, BANK_ACCOUNT)) or nil
+        end,
+
+        charge = function(src, amount, reason)
+            if not exports.qbx_core:GetPlayer(src) then return false end
+            if (tonumber(exports.qbx_core:GetMoney(src, BANK_ACCOUNT)) or 0) < amount then return false end
+
+            return exports.qbx_core:RemoveMoney(src, BANK_ACCOUNT, amount, reason) == true
+        end,
+
+        -- One more export name only (AddMoney) — the proxy rule above still holds.
+        credit = function(src, amount, reason)
+            if not exports.qbx_core:GetPlayer(src) then return false end
+
+            return exports.qbx_core:AddMoney(src, BANK_ACCOUNT, amount, reason) == true
+        end,
+    }
+end
+
+do
+    -- ox_core has no named accounts: the character has one default
+    -- account and `bankAccount` does not apply to it.
+    local Ox
+
+    local function account(src)
+        Ox = Ox or require '@ox_core.lib.init'
+
+        local player = Ox.GetPlayer(src)
+
+        return player and player:getAccount()
+    end
+
+    bankProviders.ox = {
+        balance = function(src)
+            local acc = account(src)
+
+            return acc and tonumber(acc:get('balance')) or nil
+        end,
+
+        charge = function(src, amount, reason)
+            local acc = account(src)
+
+            if not acc then return false end
+
+            -- The only provider that is atomic and cannot overdraw: it
+            -- answers with { success = boolean, message = string }.
+            local response = acc:removeBalance({ amount = amount, message = reason })
+
+            return type(response) == 'table' and response.success == true
+        end,
+
+        credit = function(src, amount, reason)
+            local acc = account(src)
+
+            if not acc then return false end
+
+            local response = acc:addBalance({ amount = amount, message = reason })
+
+            return type(response) == 'table' and response.success == true
+        end,
+    }
+end
+
+bankProviders.nd = {
+    balance = function(src)
+        local player = NDCore and NDCore.getPlayer and NDCore.getPlayer(src)
+
+        return player and tonumber(player.bank) or nil
+    end,
+
+    charge = function(src, amount, reason)
+        -- The player table handed out by the export is a snapshot, so
+        -- the balance is read from a fresh one right before charging.
+        local player = NDCore and NDCore.getPlayer and NDCore.getPlayer(src)
+
+        if not player or not player.deductMoney then return false end
+        if (tonumber(player.bank) or 0) < amount then return false end
+
+        return player.deductMoney(BANK_ACCOUNT, amount, reason) == true
+    end,
+
+    -- `addMoney` is the documented counterpart of `deductMoney`; a missing
+    -- method degrades to "no bank" and the sale fails with no_bank (items restored).
+    credit = function(src, amount, reason)
+        local player = NDCore and NDCore.getPlayer and NDCore.getPlayer(src)
+
+        if not player or not player.addMoney then return false end
+
+        return player.addMoney(BANK_ACCOUNT, amount, reason) == true
+    end,
+}
+
+---Bank balance for a player.
+---@param src number
+---@return number? balance nil when this server has no bank the shop can use
+local function bankBalance(src)
+    if not ALLOW_BANK then return end
+
+    -- Buyer hook wins: a custom banking resource replaces the framework
+    -- account entirely.
+    if type(shopCfg.GetBankBalance) == 'function' then
+        local ok, balance = pcall(shopCfg.GetBankBalance, src)
+
+        if not ok then
+            lib.print.error(('RWInv.Shop.GetBankBalance errored: %s'):format(balance))
+            return
+        end
+
+        return tonumber(balance) or nil
+    end
+
+    local provider = bankProviders[shared.framework]
+    if not provider then return end
+
+    local ok, balance = pcall(provider.balance, src)
+
+    -- A failed lookup is a normal condition (framework still booting,
+    -- player not loaded into it yet): no bank, no button, no noise.
+    if not ok then return end
+
+    return tonumber(balance) or nil
+end
+
+---Take money out of the bank.
+---@param src number
+---@param amount number
+---@param reason string
+---@return boolean charged true ONLY when the money really left the account
+local function bankCharge(src, amount, reason)
+    if not ALLOW_BANK or amount <= 0 then return false end
+
+    if type(shopCfg.ChargeBank) == 'function' then
+        local ok, charged = pcall(shopCfg.ChargeBank, src, amount, reason)
+
+        if not ok then
+            lib.print.error(('RWInv.Shop.ChargeBank errored: %s'):format(charged))
+            return false
+        end
+
+        return charged == true
+    end
+
+    local provider = bankProviders[shared.framework]
+    if not provider then return false end
+
+    local ok, charged = pcall(provider.charge, src, amount, reason)
+
+    if not ok then
+        lib.print.error(('shop: bank charge failed (%s)'):format(charged))
+        return false
+    end
+
+    return charged == true
+end
+
+---Pay money into the bank (sales). Mirrors bankCharge; the config hook
+---`RWInv.Shop.sell.CreditBank(source, amount, reason) -> boolean` wins.
+---@param src number
+---@param amount number
+---@param reason string
+---@return boolean credited true ONLY when the money really landed
+local function bankCredit(src, amount, reason)
+    if amount <= 0 then return false end
+
+    if type(sellCfg.CreditBank) == 'function' then
+        local ok, credited = pcall(sellCfg.CreditBank, src, amount, reason)
+
+        if not ok then
+            lib.print.error(('RWInv.Shop.sell.CreditBank errored: %s'):format(credited))
+            return false
+        end
+
+        return credited == true
+    end
+
+    local provider = bankProviders[shared.framework]
+    if not provider or not provider.credit then return false end
+
+    local ok, credited = pcall(provider.credit, src, amount, reason)
+
+    if not ok then
+        lib.print.error(('shop: bank credit failed (%s)'):format(credited))
+        return false
+    end
+
+    return credited == true
+end
+
+---Give a failed purchase's money back to the bank it came from. A
+---server that charges through a custom `ChargeBank` hook and has no
+---`CreditBank` counterpart is refunded through that same hook with a
+---negative amount (the only door its bank has); everyone else through
+---the provider's credit. Never as a `money` item: that is what made
+---a full inventory eat the refund.
+---@param src number
+---@param amount number
+---@param reason string
+---@return boolean refunded
+local function refundBank(src, amount, reason)
+    if amount <= 0 then return true end
+
+    if type(shopCfg.ChargeBank) == 'function' and type(sellCfg.CreditBank) ~= 'function' then
+        local ok, res = pcall(shopCfg.ChargeBank, src, -amount, reason)
+
+        if not ok then
+            lib.print.error(('RWInv.Shop.ChargeBank (refund) errored: %s'):format(res))
+            return false
+        end
+
+        return res == true
+    end
+
+    return bankCredit(src, amount, reason)
+end
+
+-- ═════════════════════════════════════════════════════════════
+--  Shop resolution (mirrors modules/shops/server.lua)
+-- ═════════════════════════════════════════════════════════════
+
+---@param inv OxInventory
+local function resolveShop(inv)
+    local currentShop = inv.currentShop
+    if not currentShop then return end
+
+    local shops = server.shops
+    if not shops then return end
+
+    local shopType, shopId = currentShop:match('^(.-) (%d-)$')
+
+    if not shopType then shopType = currentShop end
+    if shopId then shopId = tonumber(shopId) end
+
+    local shop = shopId and shops[shopType] and shops[shopType][shopId] or shops[shopType]
+
+    if shop then return shop, shopType, shopId end
+
+    -- Admin shops (modules/shops/admin_server.lua) live in a per-player
+    -- registry, not in server.shops. They resolve only while the opener's
+    -- adminShop flag is set AND the player still passes the admin check;
+    -- the purchase is then free (4th return value).
+    if inv.adminShop then
+        local ok, adminShop = pcall(function()
+            if not exports.ox_inventory:IsInventoryAdmin(inv.id) then return nil end
+            return exports.ox_inventory:ResolveAdminShop(inv.id, currentShop)
+        end)
+
+        if ok and adminShop and adminShop.adminFree then
+            return adminShop, 'adminshop', nil, true
+        end
+    end
+end
+
+local function isRequiredGrade(grade, rank)
+    if type(grade) == 'table' then
+        for i = 1, #grade do
+            if grade[i] == rank then return true end
+        end
+
+        return false
+    end
+
+    return rank ~= nil and rank >= grade
+end
+
+---Free slots left in an inventory.
+---@param inv OxInventory
+local function emptySlotCount(inv)
+    local free = 0
+    local pocketSlot = Inventory.Pocket and Inventory.Pocket.slotOf(inv)
+
+    for i = 1, inv.slots do
+        if not inv.items[i] and i ~= pocketSlot then free = free + 1 end
+    end
+
+    return free
+end
+
+local function currencyLabel(currency, amount)
+    if currency == 'money' then
+        return ('%s%s'):format(locale('$'), math.groupdigits(amount))
+    end
+
+    local item = Items(currency)
+
+    return ('%s %s'):format(math.groupdigits(amount), item and item.label or currency)
+end
+
+-- ═════════════════════════════════════════════════════════════
+--  Wallet — what the checkout buttons are allowed to show
+-- ═════════════════════════════════════════════════════════════
+
+---@param inv OxInventory
+local function walletFor(inv)
+    return {
+        cash = ALLOW_CASH and Inventory.GetItemCount(inv, BANK_CURRENCY) or false,
+        bank = ALLOW_BANK and bankBalance(inv.id) or false,
+    }
+end
+
+-- ═════════════════════════════════════════════════════════════
+--  Restock (lazy, in memory — resets on restart like stock itself)
+-- ═════════════════════════════════════════════════════════════
+--  Rows with `count` and `restock = { every, amount, max }` gain
+--  `amount` units per `every` seconds, capped at `max`. Applied when a
+--  shop is opened or a checkout/sale runs; no timers.
+
+---@param shop table
+---@return table changed rows whose count moved
+local function applyRestock(shop)
+    local changed = {}
+    local items = shop and shop.items
+
+    if not items then return changed end
+
+    local now = os.time()
+
+    for i = 1, #items do
+        local row = items[i]
+
+        if row and row.restock and row.count ~= nil then
+            local every = math.max(30, tonumber(row.restock.every) or 600)
+            local since = row.restockAt or now
+            local ticks = (now - since) // every
+
+            if ticks > 0 then
+                local max = row.restock.max or math.huge
+
+                if row.count < max then
+                    row.count = math.min(row.count + ticks * (row.restock.amount or 1), max)
+                    changed[#changed + 1] = row
+                end
+
+                row.restockAt = since + ticks * every
+            elseif not row.restockAt then
+                row.restockAt = now
+            end
+        end
+    end
+
+    return changed
+end
+
+---`{ [itemName] = shopSlotIndex }` for rows the shop buys back; cached on the shop table.
+---@param shop table
+local function buildSellIndex(shop)
+    local index = {}
+
+    for i = 1, #shop.items do
+        local row = shop.items[i]
+
+        if row and row.name and row.sellable ~= false and index[row.name] == nil then
+            index[row.name] = i
+        end
+    end
+
+    shop.sellIndex = index
+
+    return index
+end
+
+---A short, stable key for the character (3.7): the client keeps its shop
+---favourites in KVP under it, so two characters on one PC keep separate
+---lists. Two hashes of the inventory owner (the character identifier) —
+---the identifier itself never goes to the client.
+---@param owner any
+---@return string?
+local function charKey(owner)
+    if owner == nil or owner == true or owner == false then return nil end
+    local s = tostring(owner)
+    if s == '' then return nil end
+    return ('%08x%08x'):format(GetHashKey(s) & 0xffffffff, GetHashKey('oxfav:' .. s) & 0xffffffff)
+end
+
+lib.callback.register('ox_inventory:rwShopWallet', function(source)
+    local inv = Inventory(source)
+
+    if not inv then return end
+
+    local shop = resolveShop(inv)
+
+    return {
+        who = charKey(inv.owner),
+        mode = MODE,
+        wallet = walletFor(inv),
+        maxPerLine = MAX_PER_LINE,
+        quantity = SHOW_QUANTITY,
+        sell = {
+            enabled = sellEnabled() and shop ~= nil and shop.allowSell == true,
+            rate = sellRate(shop),
+            payTo = sellPayTo(),
+        },
+        restocked = shop and applyRestock(shop) or nil,
+        currencyLabel = shop and shop.currencyLabel or nil,
+    }
+end)
+
+-- ═════════════════════════════════════════════════════════════
+--  Checkout
+-- ═════════════════════════════════════════════════════════════
+
+local function fail(description, id)
+    return false, nil, { id = id, code = id, type = 'error', description = description }
+end
+
+local rwShopBuyImpl = function(source, data)
+    if MODE ~= 'basket' then return false end
+    if type(data) ~= 'table' or type(data.items) ~= 'table' then return false end
+
+    local payment = data.payment == 'bank' and 'bank' or 'cash'
+
+    if payment == 'cash' and not ALLOW_CASH then return false end
+    if payment == 'bank' and not ALLOW_BANK then return false end
+
+    local inv = Inventory(source)
+
+    if not inv or not inv.currentShop then return false end
+
+    local shop, shopType, shopId, adminFree = resolveShop(inv)
+
+    if not shop or not shop.items then return false end
+
+    applyRestock(shop)
+
+    -- The player may have walked away with the UI still open.
+    if type(shop.coords) == 'vector3' and #(GetEntityCoords(GetPlayerPed(source)) - shop.coords) > 10 then
+        return fail(locale('inventory_lost_access'), 'lost_access')
+    end
+
+    local rank
+
+    if shop.groups then
+        local group, grade = server.hasGroup(inv, shop.groups)
+
+        if not group then return false end
+
+        rank = grade
+    end
+
+    -- ── validate every line before anything moves ────────────
+    local lines = {}
+    local totals = {}        -- currency -> amount
+    local totalWeight = 0
+    local neededSlots = 0
+    local seen = {}
+    local pendingStacks = {} -- item name -> a new stack of it is already counted
+
+    for i = 1, #data.items do
+        if i > MAX_LINES then break end
+
+        local line = data.items[i]
+
+        if type(line) ~= 'table' then return false end
+
+        local slotId = wholeNumber(line.slot)
+        local count = wholeNumber(line.count)
+
+        if not slotId or not count or slotId < 1 or count < 1 then return false end
+        if count > MAX_PER_LINE then count = MAX_PER_LINE end
+
+        -- One line per shop slot; a duplicated slot would let the same
+        -- stock be validated twice.
+        if seen[slotId] then return false end
+        seen[slotId] = true
+
+        local shopSlot = shop.items[slotId]
+
+        if not shopSlot or not shopSlot.name then return false end
+
+        if shopSlot.count then
+            -- `< 1`, not `== 0`: a row driven negative by a race must
+            -- read as sold out, not as "clamp to a negative count".
+            if shopSlot.count < 1 then
+                return fail(locale('shop_nostock'), 'nostock')
+            elseif count > shopSlot.count then
+                count = shopSlot.count
+            end
+        end
+
+        -- V3: per-checkout cap on this row
+        if shopSlot.maxPerPurchase and count > shopSlot.maxPerPurchase then
+            count = shopSlot.maxPerPurchase
+        end
+
+        if shopSlot.license and server.hasLicense and not server.hasLicense(inv, shopSlot.license) then
+            return fail(locale('item_unlicensed'), 'unlicensed')
+        end
+
+        if shopSlot.grade and not isRequiredGrade(shopSlot.grade, rank) then
+            return fail(locale('stash_lowgrade'), 'lowgrade')
+        end
+
+        local item = Items(shopSlot.name)
+
+        if not item then return false end
+
+        -- Item callbacks can veto a sale (buying licences, etc.).
+        if item.cb and item.cb('buying', item, inv, slotId, shop) == false then return false end
+
+        -- The RAW shop metadata is what `Inventory.AddItem` resolves when
+        -- the item is handed over, so anything generated per item (weapon
+        -- serials, container ids, durability) is generated exactly once,
+        -- by the same code path stock ox_inventory uses. Resolving it here
+        -- as well fired createItem hooks and minted serials for items that
+        -- were never created — and, for non-stack items, forced the count
+        -- to 1 while the UI let the player pick (and the row charge) N.
+        local rawMetadata = shopSlot.metadata and table.clone(shopSlot.metadata) or {}
+
+        local currency = shopSlot.currency or 'money'
+        local price = count * (shopSlot.price or 0)
+
+        totals[currency] = (totals[currency] or 0) + price
+        totalWeight = totalWeight + (item.weight + (rawMetadata.weight or 0)) * count
+
+        -- Stackable items land on a stack they already have; a NEW stack
+        -- needs one free slot (once per item across the basket).
+        -- Everything else needs one free slot per unit.
+        if item.stack then
+            local stacked = Inventory.GetSlotWithItem and Inventory.GetSlotWithItem(inv, item.name, rawMetadata, false)
+
+            if not stacked and not pendingStacks[item.name] then
+                pendingStacks[item.name] = true
+                neededSlots = neededSlots + 1
+            end
+        else
+            neededSlots = neededSlots + count
+        end
+
+        lines[#lines + 1] = {
+            slot = slotId,
+            item = item,
+            count = count,
+            price = price,
+            currency = currency,
+            metadata = rawMetadata,
+            rawMetadata = rawMetadata,
+        }
+    end
+
+    if #lines == 0 then return false end
+
+    -- ── capacity ─────────────────────────────────────────────
+    if inv.weight + totalWeight > (Inventory.MaxWeight and Inventory.MaxWeight(inv) or inv.maxWeight) then
+        return fail(locale('cannot_carry'), 'cannot_carry')
+    end
+
+    if neededSlots > emptySlotCount(inv) then
+        return fail(locale('cannot_carry'), 'cannot_carry')
+    end
+
+    -- ── money ────────────────────────────────────────────────
+    -- The bank holds ordinary money only. A basket priced in anything
+    -- else is a cash basket, whatever the button said.
+    if payment == 'bank' then
+        for currency in pairs(totals) do
+            if currency ~= BANK_CURRENCY then
+                return fail(locale('rw_shop_bank_currency'), 'bank_currency')
+            end
+        end
+    end
+
+    if payment == 'cash' then
+        for currency, amount in pairs(totals) do
+            if amount > 0 and Inventory.GetItemCount(inv, currency) < amount then
+                return fail(locale('cannot_afford', currencyLabel(currency, amount)), 'cannot_afford')
+            end
+        end
+    else
+        local amount = totals[BANK_CURRENCY] or 0
+        local balance = bankBalance(source)
+
+        if not adminFree and not balance then return fail(locale('rw_shop_no_bank'), 'no_bank') end
+        if balance and balance < amount then
+            return fail(locale('cannot_afford', currencyLabel(BANK_CURRENCY, amount)), 'cannot_afford')
+        end
+    end
+
+    -- ── hooks (a hook may still refuse the whole basket) ─────
+    -- ox_inventory 2.47+ contract: TriggerEventHooks returns a to-be-closed
+    -- table ({ success = bool, [n] = hookId }) whose __close fires the
+    -- post-events (`resource:buyItem:n`) with the final verdict. The basket
+    -- triggers one hook per line, so the results are held here and closed
+    -- together once the outcome of the WHOLE purchase is known — on every
+    -- exit path, thanks to the <close> guard below.
+    local hookResults = {}
+    local outcome = { success = false }
+    local hookCloser <close> = setmetatable({}, {
+        __close = function()
+            for i = 1, #hookResults do
+                local hooks = hookResults[i]
+                hooks.success = outcome.success
+                local mt = getmetatable(hooks)
+                if mt and mt.__close then mt.__close(hooks) end
+            end
+        end
+    })
+
+    for i = 1, #lines do
+        local line = lines[i]
+
+        local hooks = runEventHooks('buyItem', {
+            source = source,
+            shopType = shopType,
+            shopId = shopId,
+            toInventory = inv.id,
+            toSlot = nil,
+            fromSlot = shop.items[line.slot],
+            itemName = line.item.name,
+            metadata = line.metadata,
+            count = line.count,
+            price = shop.items[line.slot].price,
+            totalPrice = line.price,
+            currency = line.currency,
+            payment = payment,
+        })
+
+        hookResults[#hookResults + 1] = hooks
+
+        if not hooks.success then return false end
+    end
+
+    -- ── stock (reserved before any money moves) ──────────────
+    -- The licence lookup, the hooks and the bank providers may all
+    -- yield; two buyers validating the same last unit both passed, and
+    -- the row went negative. Take the stock now, give it back on any
+    -- failure below.
+    local updatedSlots = {}
+    local reserved = {}
+
+    local function releaseStock()
+        for i = 1, #reserved do
+            local r = reserved[i]
+            r.row.count = r.row.count + r.count
+        end
+
+        reserved = {}
+    end
+
+    for i = 1, #lines do
+        local line = lines[i]
+        local shopSlot = shop.items[line.slot]
+
+        if shopSlot.count then
+            if shopSlot.count < line.count then
+                releaseStock()
+                return fail(locale('shop_nostock'), 'nostock')
+            end
+
+            shopSlot.count = shopSlot.count - line.count
+            reserved[#reserved + 1] = { row = shopSlot, count = line.count }
+            updatedSlots[#updatedSlots + 1] = shopSlot
+        end
+    end
+
+    -- ── charge ───────────────────────────────────────────────
+    -- Money first: an item that cannot be handed over is refunded
+    -- below, but an item handed over before payment could be dropped
+    -- and kept. The snapshot is what "refunded" means: every slot goes
+    -- back to exactly this, cash included.
+    local snapshot = snapshotItems(inv)
+
+    if payment == 'cash' then
+        for currency, amount in pairs(totals) do
+            if amount > 0 and not Inventory.RemoveItem(inv, currency, amount) then
+                restoreItems(inv, snapshot)
+                releaseStock()
+
+                return fail(locale('cannot_afford', currencyLabel(currency, amount)), 'cannot_afford')
+            end
+        end
+    else
+        local amount = totals[BANK_CURRENCY] or 0
+
+        if amount > 0 and not bankCharge(source, amount, ('%s (%s)'):format(shop.label or 'shop', locale('rw_shop_reason'))) then
+            releaseStock()
+
+            return fail(locale('cannot_afford', currencyLabel(BANK_CURRENCY, amount)), 'cannot_afford')
+        end
+    end
+
+    -- ── deliver ──────────────────────────────────────────────
+    local ok = true
+
+    for i = 1, #lines do
+        local line = lines[i]
+
+        if not Inventory.AddItem(inv, line.item, line.count, line.rawMetadata) then
+            ok = false
+            break
+        end
+    end
+
+    if not ok then
+        -- Put the world back exactly as it was: items out, cash in, stock back.
+        restoreItems(inv, snapshot)
+        releaseStock()
+
+        if payment == 'bank' then
+            local amount = totals[BANK_CURRENCY] or 0
+
+            if amount > 0 and not refundBank(source, amount, locale('rw_shop_refund')) then
+                lib.print.error(('shop: could not refund %s to the bank of player %s after a failed delivery'):format(amount, source))
+
+                if server.Log and server.Log.record then
+                    server.Log.record('exploit', { actor = source, severity = 2, extra = { event = 'shop_refund_failed', amount = amount, shop = shop.label } })
+                end
+            end
+        end
+
+        return fail(locale('cannot_carry'), 'cannot_carry')
+    end
+
+    if server.syncInventory then server.syncInventory(inv) end
+
+    -- ── log ──────────────────────────────────────────────────
+    local totalPaid = 0
+
+    for _, amount in pairs(totals) do totalPaid = totalPaid + amount end
+
+    if server.loglevel > 0 and (server.loglevel > 1 or totalPaid >= 500) then
+        local names = {}
+
+        for i = 1, #lines do
+            names[i] = ('%sx %s'):format(lines[i].count, lines[i].item.name)
+        end
+
+        lib.logger(inv.owner, 'buyItem', ('"%s" bought %s (%s, %s)'):format(
+            inv.label, table.concat(names, ', '), currencyLabel(BANK_CURRENCY, totalPaid), payment),
+            ('shop:%s'):format(shop.label))
+    end
+
+    -- The log registry (multi-line form: one row per line, one basket id).
+    -- AddItem skips its own row for internal calls, so without this a
+    -- purchase never reached the logs or the webhooks while a sale did.
+    if server.Log and server.Log.record then
+        local logLines = {}
+
+        for i = 1, #lines do
+            local line = lines[i]
+            logLines[i] = { item = line.item.name, count = line.count, price = line.price, currency = line.currency, metadata = line.rawMetadata }
+        end
+
+        pcall(server.Log.record, 'buy', {
+            actor = source,
+            from = { id = shopId and ('%s:%s'):format(shopType, shopId) or shopType, type = 'shop', label = shop.label },
+            to = inv,
+            lines = logLines,
+            totals = totals,
+            payment = payment,
+            shopType = shopType,
+            shopId = shopId,
+            coords = shop.coords,
+        })
+    end
+
+    local parts = {}
+
+    for currency, amount in pairs(totals) do
+        parts[#parts + 1] = currencyLabel(currency, amount)
+    end
+
+    outcome.success = true
+
+    return true, {
+        slots = updatedSlots,
+        wallet = walletFor(inv),
+        payment = payment,
+        weight = inv.weight,
+    }, {
+        type = 'success',
+        code = 'paid',
+        description = locale('rw_shop_paid', table.concat(parts, ' + ')),
+    }
+end
+
+-- TEMP DEBUG (round 8): log the buy's state + verdict, then strip.
+lib.callback.register('ox_inventory:rwShopBuy', function(source, data)
+    local inv = Inventory(source)
+    local okA, isAdmin = pcall(function() return exports.ox_inventory:IsInventoryAdmin(source) end)
+    local okR, adm = pcall(function() return exports.ox_inventory:ResolveAdminShop(source, inv and inv.currentShop) end)
+    print(('^3[rwshop-dbg] buy from %s: currentShop=%s adminShop=%s isAdmin=%s resolveAdmin=%s payment=%s lines=%s^0'):format(
+        source, inv and tostring(inv.currentShop), inv and tostring(inv.adminShop), tostring(isAdmin), tostring(okR and adm ~= nil), data and tostring(data.payment), data and data.items and #data.items))
+    local a, b, c = rwShopBuyImpl(source, data)
+    print(('^3[rwshop-dbg] verdict: %s msg=%s^0'):format(tostring(a), c and tostring(c.id) or 'BARE'))
+    return a, b, c
+end)
+
+-- ═════════════════════════════════════════════════════════════
+--  Sell — ox_inventory:rwShopSell { items = { { slot, count }, … } }
+-- ═════════════════════════════════════════════════════════════
+--  Player slots → shop. Prices are recomputed here from basePrice × rate
+--  (or the row's sellPrice); the UI figure is display only. Slots are
+--  locked, items leave BEFORE the payout, and any failure puts every
+--  item back — a sale is all-or-nothing like a purchase.
+lib.callback.register('ox_inventory:rwShopSell', function(source, data)
+    if not sellEnabled() then return false end
+    if type(data) ~= 'table' or type(data.items) ~= 'table' then return false end
+
+    local inv = Inventory(source)
+
+    if not inv or not inv.currentShop then return false end
+
+    local shop, shopType, shopId = resolveShop(inv)
+
+    if not shop or not shop.items then return false end
+
+    applyRestock(shop)
+
+    if shop.allowSell ~= true then
+        return fail(locale('rw_shop_sell_disabled'), 'sell_disabled')
+    end
+
+    if type(shop.coords) == 'vector3' and #(GetEntityCoords(GetPlayerPed(source)) - shop.coords) > 10 then
+        return fail(locale('inventory_lost_access'), 'lost_access')
+    end
+
+    if shop.groups then
+        local group = server.hasGroup(inv, shop.groups)
+
+        if not group then return false end
+    end
+
+    local sellIndex = shop.sellIndex or buildSellIndex(shop)
+    local rate = sellRate(shop)
+    local payTo = sellPayTo()
+    local durabilityScaled = sellDurability()
+    -- (a pocket item parked past the grid while the pocket is off is still sellable)
+    local slotLimit = math.max(inv.slots or 0, Inventory.Pocket and Inventory.Pocket.slotOf(inv) or 0)
+
+    -- ── validate every line before anything moves ────────────
+    local lines = {}
+    local totals = {}
+    local seen = {}
+
+    for i = 1, #data.items do
+        if i > MAX_LINES then break end
+
+        local line = data.items[i]
+
+        if type(line) ~= 'table' then return false end
+
+        local slotId = wholeNumber(line.slot)
+        local count = wholeNumber(line.count)
+
+        if not slotId or not count or slotId < 1 or slotId > slotLimit or count < 1 then return false end
+        if seen[slotId] then return false end
+        seen[slotId] = true
+
+        local slotData = inv.items[slotId]
+
+        if not slotData or not slotData.name then
+            return fail(locale('rw_shop_not_sellable'), 'not_sellable')
+        end
+
+        if not (slotData.count >= 1) then return false end
+        if count > slotData.count then count = slotData.count end
+
+        local rowIdx = sellIndex[slotData.name]
+        local row = rowIdx and shop.items[rowIdx]
+
+        if not row then
+            return fail(locale('rw_shop_not_sellable'), 'not_sellable')
+        end
+
+        local item = Items(slotData.name)
+
+        if not item then return false end
+        if item.cb and item.cb('selling', item, inv, slotId, shop) == false then return false end
+
+        local currency = row.currency or 'money'
+        local unit = tonumber(row.sellPrice) or math.floor((row.basePrice or row.price or 0) * rate)
+
+        -- Never above what the row sells for: basePrice is the list price
+        -- BEFORE the row's discount, so a discount past the sell rate made
+        -- buy → sell a money printer (and with restock on, an endless one).
+        local buyPrice = tonumber(row.price)
+
+        if buyPrice and unit > buyPrice then unit = buyPrice end
+
+        if durabilityScaled and type(slotData.metadata) == 'table' and type(slotData.metadata.durability) == 'number'
+            and slotData.metadata.durability <= 100 then
+            unit = math.floor(unit * slotData.metadata.durability / 100)
+        end
+
+        if unit ~= unit or unit < 0 then return false end
+
+        totals[currency] = (totals[currency] or 0) + unit * count
+
+        lines[#lines + 1] = {
+            slot = slotId,
+            data = slotData,
+            item = item,
+            count = count,
+            unit = unit,
+            price = unit * count,
+            currency = currency,
+            rowIdx = rowIdx,
+        }
+    end
+
+    if #lines == 0 then return false end
+
+    -- ── locks ────────────────────────────────────────────────
+    local keys = {}
+
+    for i = 1, #lines do
+        keys[i] = ('inventory-%s:slot-%s'):format(inv.id, lines[i].slot)
+    end
+
+    local activeSlots <close> = GetLocks(keys)
+
+    if not activeSlots then
+        return fail(locale('rw_shop_busy'), 'busy')
+    end
+
+    -- ── hooks (aggregate closer, same contract as the basket) ─
+    local hookResults = {}
+    local outcome = { success = false }
+    local hookCloser <close> = setmetatable({}, {
+        __close = function()
+            for i = 1, #hookResults do
+                local hooks = hookResults[i]
+                hooks.success = outcome.success
+                local mt = getmetatable(hooks)
+                if mt and mt.__close then mt.__close(hooks) end
+            end
+        end
+    })
+
+    for i = 1, #lines do
+        local line = lines[i]
+
+        local hooks = runEventHooks('sellItem', {
+            source = source,
+            shopType = shopType,
+            shopId = shopId,
+            fromInventory = inv.id,
+            toInventory = shopType,
+            fromSlot = line.data,
+            fromType = inv.type,
+            itemName = line.data.name,
+            metadata = line.data.metadata,
+            count = line.count,
+            price = line.unit,
+            totalPrice = line.price,
+            currency = line.currency,
+            payTo = payTo,
+        })
+
+        hookResults[#hookResults + 1] = hooks
+
+        if not hooks.success then return false end
+    end
+
+    -- ── items first ──────────────────────────────────────────
+    local removed = {}
+
+    local function restore()
+        for i = 1, #removed do
+            local l = removed[i]
+            Inventory.AddItem(inv, l.item, l.count, l.data.metadata, l.slot)
+        end
+    end
+
+    for i = 1, #lines do
+        local line = lines[i]
+
+        if not Inventory.RemoveItem(inv, line.item, line.count, line.data.metadata, line.slot) then
+            restore()
+            outcome.success = false
+            return fail(locale('rw_shop_busy'), 'busy')
+        end
+
+        removed[#removed + 1] = line
+    end
+
+    -- ── payout ───────────────────────────────────────────────
+    local paid = {}
+
+    for currency, amount in pairs(totals) do
+        if amount > 0 then
+            local ok
+
+            if currency == 'money' and payTo == 'bank' then
+                ok = bankCredit(source, amount, ('%s (%s)'):format(shop.label or 'shop', locale('rw_shop_sell_reason')))
+            else
+                ok = Inventory.AddItem(inv, currency, amount) and true or false
+            end
+
+            if not ok then
+                -- Undo the payouts that did land, then put every item back.
+                -- An undo that fails (the bank refused to take the money
+                -- back) means the player already holds that payout: the
+                -- items for it must NOT come back as well.
+                local undone = true
+
+                for i = 1, #paid do
+                    local p = paid[i]
+                    local reverted
+
+                    if p.bank then
+                        reverted = bankCharge(source, p.amount, locale('rw_shop_refund'))
+                    else
+                        reverted = Inventory.RemoveItem(inv, p.currency, p.amount) and true or false
+                    end
+
+                    if not reverted then undone = false end
+                end
+
+                if undone then
+                    restore()
+                else
+                    lib.print.error(('shop: sale of player %s half-failed and a payout could not be taken back; items were not restored'):format(source))
+
+                    if server.Log and server.Log.record then
+                        pcall(server.Log.record, 'exploit', { actor = source, severity = 2, extra = { event = 'shop_sell_undo_failed', shop = shop.label } })
+                    end
+                end
+
+                outcome.success = false
+                return fail(locale('rw_shop_no_bank'), 'no_bank')
+            end
+
+            paid[#paid + 1] = { currency = currency, amount = amount, bank = currency == 'money' and payTo == 'bank' }
+        end
+    end
+
+    -- ── stock ────────────────────────────────────────────────
+    local updatedSlots = {}
+
+    if SELL_RESTOCK then
+        for i = 1, #lines do
+            local line = lines[i]
+            local row = shop.items[line.rowIdx]
+
+            if row and row.count ~= nil then
+                local max = row.restock and row.restock.max or math.huge
+                row.count = math.min(row.count + line.count, max)
+                updatedSlots[#updatedSlots + 1] = row
+            end
+        end
+    end
+
+    if server.syncInventory then server.syncInventory(inv) end
+
+    -- ── log ──────────────────────────────────────────────────
+    local totalPaid = 0
+    local currency = 'money'
+
+    for c, amount in pairs(totals) do
+        totalPaid = totalPaid + amount
+        if amount > 0 then currency = c end
+    end
+
+    if server.loglevel > 0 then
+        local names = {}
+
+        for i = 1, #lines do
+            names[i] = ('%sx %s'):format(lines[i].count, lines[i].item.name)
+        end
+
+        lib.logger(inv.owner, 'sellItem', ('"%s" sold %s (%s, %s)'):format(
+            inv.label, table.concat(names, ', '), currencyLabel(currency, totalPaid), payTo),
+            ('shop:%s'):format(shop.label))
+    end
+
+    if server.Log and server.Log.record then
+        for i = 1, #lines do
+            local line = lines[i]
+
+            server.Log.record('sell', {
+                item = line.item,
+                count = line.count,
+                metadata = line.data.metadata,
+                from = inv,
+                to = shopId and ('shop:%s:%s'):format(shopType, shopId) or ('shop:%s'):format(shopType),
+                actor = source,
+                coords = shop.coords,
+                extra = {
+                    shopType = shopType,
+                    shopId = shopId,
+                    shop = shop.label,
+                    price = line.unit,
+                    totalPrice = line.price,
+                    currency = line.currency,
+                    payment = payTo,
+                },
+            })
+        end
+    end
+
+    local parts = {}
+
+    for c, amount in pairs(totals) do
+        parts[#parts + 1] = currencyLabel(c, amount)
+    end
+
+    outcome.success = true
+
+    return true, {
+        slots = updatedSlots,
+        wallet = walletFor(inv),
+        total = totalPaid,
+        currency = currency,
+        payTo = payTo,
+        weight = inv.weight,
+    }, {
+        type = 'success',
+        code = 'sold',
+        description = locale('rw_shop_sold', table.concat(parts, ' + ')),
+    }
+end)

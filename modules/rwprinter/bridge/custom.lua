@@ -1,0 +1,144 @@
+--  REALWRLD · 3D PRINTER SYSTEM
+--  bridge/custom.lua -- your own inventory
+-- ---------------------------------------------------------------------------
+--
+--  THIS FILE IS OPEN IN BOTH EDITIONS, ESCROW INCLUDED.
+--
+--  It is the one place you are meant to edit when your inventory is not one
+--  of the nine the bridge detects on its own, or when your build of a
+--  supported one answers differently.
+--
+--  ─────────────────────────────────────────────────────────────────────────
+--  HOW IT WORKS
+--
+--  Every inventory operation in this resource goes through FOUR functions.
+--  Anything you define here WINS over the detected inventory; anything you
+--  leave commented out keeps using it. So you can either:
+--
+--    * OVERRIDE ONE FUNCTION and leave the other three alone -- a fork whose
+--      "can this player carry it" export has a different name, for example;
+--
+--    * or support an inventory the bridge knows nothing about: define all
+--      four and set  PrinterConfig.Inventory = 'custom'  in config/config.lua.
+--
+--  All four run on the SERVER. `src` is the player's server id.
+--
+--  Nothing else in the resource touches an inventory, so these four are the
+--  whole contract -- the recipe helpers (materials taken when a job is
+--  queued, refunds when it is cancelled) are built out of them and need no
+--  changes at all.
+--
+--  ─────────────────────────────────────────────────────────────────────────
+--  IF YOU GET IT WRONG
+--
+--  Every call is wrapped in pcall, so a bad export name degrades into "this
+--  failed" instead of crashing the resource. And if PrinterConfig.Inventory is
+--  'custom' with a function missing, the server console names it on start:
+--
+--    [rwprinter] PrinterConfig.Inventory = 'custom' but bridge/custom.lua
+--    [rwprinter] does not define: AddItem, CanCarry
+--
+--  It never fails silently.
+-- ---------------------------------------------------------------------------
+
+CustomInventory = {}
+
+-- ---------------------------------------------------------------------------
+--  1. How many of `item` the player is carrying.
+--
+--  Used to check a recipe before a job is queued, and to count batteries.
+--  Return 0 when they have none -- never nil.
+-- ---------------------------------------------------------------------------
+
+---@param src number    player server id
+---@param item string   inventory item name
+---@return number
+-- function CustomInventory.GetCount(src, item)
+--     return exports['my-inventory']:GetItemCount(src, item) or 0
+-- end
+
+-- ---------------------------------------------------------------------------
+--  2. Give the player an item.
+--
+--  This is how a finished print reaches its owner. Return false when it did
+--  not fit -- the print then STAYS on the printer's tray instead of being
+--  destroyed, and the player is told to make room.
+--
+--  `metadata` is a table or nil. Ignore it if your inventory has no such
+--  concept; the resource does not depend on it.
+-- ---------------------------------------------------------------------------
+
+---@param src number
+---@param item string
+---@param count number
+---@param metadata table|nil
+---@return boolean success
+-- function CustomInventory.AddItem(src, item, count, metadata)
+--     return exports['my-inventory']:AddItem(src, item, count, metadata) and true or false
+-- end
+
+-- ---------------------------------------------------------------------------
+--  3. Take an item away.
+--
+--  Used for the materials of a recipe and for the battery item. Return false
+--  when the player did not actually have it.
+--
+--  Returning true when nothing was taken is the one mistake that really
+--  costs: the resource would believe the materials were paid for.
+-- ---------------------------------------------------------------------------
+
+---@param src number
+---@param item string
+---@param count number
+---@param metadata table|nil
+---@return boolean success
+-- function CustomInventory.RemoveItem(src, item, count, metadata)
+--     return exports['my-inventory']:RemoveItem(src, item, count) and true or false
+-- end
+
+-- ---------------------------------------------------------------------------
+--  4. Has the player room for this?
+--
+--  Asked BEFORE anything is handed over, so a finished print is never lost to
+--  a full bag. If your inventory cannot answer, return true -- AddItem is
+--  checked anyway, so nothing is destroyed either way.
+-- ---------------------------------------------------------------------------
+
+---@param src number
+---@param item string
+---@param count number
+---@return boolean
+-- function CustomInventory.CanCarry(src, item, count)
+--     return exports['my-inventory']:CanCarryItem(src, item, count) and true or false
+-- end
+
+-- ---------------------------------------------------------------------------
+--  A WORKED EXAMPLE
+--
+--  An inventory whose exports take the player object rather than the server
+--  id, and which has no "can carry" check at all. Three functions defined,
+--  the fourth left out on purpose -- leaving CanCarry undefined means the
+--  bridge uses the detected inventory's answer, and if there is no detected
+--  inventory it assumes there is room.
+--
+--    function CustomInventory.GetCount(src, item)
+--        local player = exports['my-framework']:GetPlayer(src)
+--        if not player then return 0 end
+--        return exports['my-inventory']:Count(player.identifier, item) or 0
+--    end
+--
+--    function CustomInventory.AddItem(src, item, count, metadata)
+--        local player = exports['my-framework']:GetPlayer(src)
+--        if not player then return false end
+--        return exports['my-inventory']:Give(player.identifier, item, count) == true
+--    end
+--
+--    function CustomInventory.RemoveItem(src, item, count, metadata)
+--        local player = exports['my-framework']:GetPlayer(src)
+--        if not player then return false end
+--        return exports['my-inventory']:Take(player.identifier, item, count) == true
+--    end
+--
+--  With PrinterConfig.Inventory = 'auto' those three override whatever was
+--  detected. With PrinterConfig.Inventory = 'custom' the console will point out
+--  that CanCarry is missing -- add it, or leave it and accept the default.

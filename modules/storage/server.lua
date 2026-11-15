@@ -1,0 +1,891 @@
+-- Storage System Server Module
+-- Handles stash data persistence using MySQL (oxmysql)
+
+if not lib then return end
+
+local MySQL = MySQL
+local stashCache = {} -- In-memory cache for performance
+
+-- Helper function to get player identifier
+local function GetPlayerIdentifier(source)
+    return GetPlayerIdentifierByType(source, 'license')
+end
+
+-- Initialize database table
+MySQL.ready(function()
+    CreateThread(function()
+        -- Stagger storage loading (T+2s) to prevent DB congestion
+        Wait(2000)
+        local success, err = pcall(function()
+            MySQL.query([[
+                CREATE TABLE IF NOT EXISTS `ox_inventory_stashes` (
+                    `id` VARCHAR(50) NOT NULL,
+                    `owner` VARCHAR(60) NOT NULL,
+                    `type` VARCHAR(20) NOT NULL DEFAULT 'small',
+                    `model` VARCHAR(50) NOT NULL DEFAULT 'p_v_43_safe_s',
+                    `coords_x` FLOAT NOT NULL,
+                    `coords_y` FLOAT NOT NULL,
+                    `coords_z` FLOAT NOT NULL,
+                    `heading` FLOAT NOT NULL DEFAULT 0.0,
+                    `rotation_x` FLOAT DEFAULT 0.0,
+                    `rotation_y` FLOAT DEFAULT 0.0,
+                    `rotation_z` FLOAT DEFAULT 0.0,
+                    `slots` INT NOT NULL DEFAULT 50,
+                    `max_weight` INT NOT NULL DEFAULT 100000,
+                    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    INDEX `idx_owner` (`owner`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            ]], {}, function(result)
+
+                -- Load all stashes into cache via callback (non-blocking)
+                MySQL.query('SELECT * FROM ox_inventory_stashes', {}, function(stashes)
+                    if stashes then
+                        for _, stash in ipairs(stashes) do
+                            stashCache[stash.id] = {
+                                id = stash.id,
+                                owner = stash.owner,
+                                type = stash.type,
+                                model = stash.model,
+                                coords = { x = stash.coords_x, y = stash.coords_y, z = stash.coords_z },
+                                heading = stash.heading,
+                                rotation = { x = stash.rotation_x or 0, y = stash.rotation_y or 0, z = stash.rotation_z or 0 },
+                                slots = stash.slots,
+                                maxWeight = stash.max_weight
+                            }
+                            -- RW soft-fix: safes were cached but never RegisterStash'd after restart
+                            pcall(function()
+                                exports.ox_inventory:RegisterStash(stash.id, stash.id, stash.slots, stash.max_weight, stash.owner)
+                            end)
+                        end
+                    end
+                end)
+            end)
+        end)
+
+        if not success then
+        end
+    end)
+end)
+
+-- Create or update stash in database
+local function CreateStash(stashData)
+    local stash = {
+        id = stashData.id,
+        owner = stashData.owner,
+        type = stashData.type or 'small',
+        model = stashData.model or 'p_v_43_safe_s',
+        coords = stashData.coords,
+        heading = stashData.heading or 0,
+        rotation = stashData.rotation or { x = 0, y = 0, z = 0 },
+        slots = stashData.slots or 50,
+        maxWeight = stashData.maxWeight or 100000
+    }
+
+    -- Upsert into database
+    MySQL.insert([[
+        INSERT INTO ox_inventory_stashes
+        (id, owner, type, model, coords_x, coords_y, coords_z, heading, rotation_x, rotation_y, rotation_z, slots, max_weight)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+        coords_x = VALUES(coords_x),
+        coords_y = VALUES(coords_y),
+        coords_z = VALUES(coords_z),
+        heading = VALUES(heading),
+        rotation_x = VALUES(rotation_x),
+        rotation_y = VALUES(rotation_y),
+        rotation_z = VALUES(rotation_z)
+    ]], {
+        stash.id,
+        stash.owner,
+        stash.type,
+        stash.model,
+        stash.coords.x,
+        stash.coords.y,
+        stash.coords.z,
+        stash.heading,
+        stash.rotation.x or 0,
+        stash.rotation.y or 0,
+        stash.rotation.z or 0,
+        stash.slots,
+        stash.maxWeight
+    })
+
+    -- Update cache
+    stashCache[stash.id] = stash
+
+    return stash
+end
+
+-- Delete stash from database
+local function DeleteStash(stashId)
+    MySQL.query('DELETE FROM ox_inventory_stashes WHERE id = ?', { stashId })
+
+    -- Remove from cache
+    stashCache[stashId] = nil
+
+    -- Also remove the ox_inventory stash data
+    exports.ox_inventory:ClearInventory(stashId)
+
+    return true
+end
+
+-- Get stash by ID
+local function GetStash(stashId)
+    return stashCache[stashId]
+end
+
+-- Get all stashes for a player
+local function GetPlayerStashes(identifier)
+    local playerStashes = {}
+    for _, stash in pairs(stashCache) do
+        if stash.owner == identifier then
+            playerStashes[#playerStashes + 1] = stash
+        end
+    end
+    return playerStashes
+end
+
+-- Get all stashes in range
+local function GetStashesInRange(coords, range)
+    local nearbyStashes = {}
+    for _, stash in pairs(stashCache) do
+        local dist = #(vector3(stash.coords.x, stash.coords.y, stash.coords.z) - coords)
+        if dist <= range then
+            nearbyStashes[#nearbyStashes + 1] = stash
+        end
+    end
+    return nearbyStashes
+end
+
+-- Check access permissions
+local function CanAccessStash(source, stash)
+    if not stash then return false end
+
+    -- Owner check
+    if stash.owner then
+        local identifier = GetPlayerIdentifier(source)
+        if stash.owner ~= identifier then
+            return false
+        end
+    end
+
+    return true
+end
+
+-- Purchase storage event (legacy - uses cash)
+RegisterNetEvent('ox_inventory:purchaseStorage', function(data)
+    local source = source
+    local identifier = GetPlayerIdentifier(source)
+
+    if not identifier then
+        lib.notify(source, { title = 'Storage', description = 'Failed to verify identity', type = 'error' })
+        return
+    end
+
+    -- Price validation (add your economy check here)
+    local prices = {
+        small = 50000,
+        medium = 100000,
+        large = 150000,
+        upgraded = 250000
+    }
+    
+    local itemNames = {
+        small = 'safe_small',
+        medium = 'safe_medium',
+        large = 'safe_large',
+        xxl = 'sf_prop_v_43_safe_s_bk_01a'
+    }
+
+    local price = prices[data.type]
+    if not price then
+        lib.notify(source, { title = 'Storage', description = 'Invalid storage type', type = 'error' })
+        return
+    end
+
+    -- Check if player can afford (integrate with your economy)
+    -- Example with ox_inventory money:
+    local playerMoney = exports.ox_inventory:GetItemCount(source, 'money')
+    if playerMoney < price then
+        lib.notify(source, { title = 'Storage', description = 'Not enough money', type = 'error' })
+        return
+    end
+
+    -- Deduct money
+    if exports.ox_inventory:RemoveItem(source, 'money', price) then
+        -- Grant the safe item
+        local itemName = itemNames[data.type]
+        exports.ox_inventory:AddItem(source, itemName, 1)
+
+        lib.notify(source, {
+            title = 'Storage Purchased',
+            description = ('Paid $%s for %s. Check your inventory!'):format(math.groupdigits(price), data.type:upper() .. ' Safe'),
+            type = 'success'
+        })
+    end
+end)
+
+-- ============================================
+-- BANK PAYMENT CALLBACK FOR /PSTORAGE COMMAND
+-- ============================================
+lib.callback.register('ox_inventory:purchaseStorageBank', function(source, stashType)
+    local prices = {
+        small = 50000,
+        medium = 100000,
+        large = 150000,
+        upgraded = 250000
+    }
+
+    local itemNames = {
+        small = 'safe_small',
+        medium = 'safe_medium',
+        large = 'safe_large',
+        upgraded = 'sf_prop_v_43_safe_s_bk_01a'
+    }
+
+    local price = prices[stashType]
+    if not price then
+        return false
+    end
+
+    -- Get player using framework bridge
+    local Player = server.GetPlayerFromId(source)
+    if not Player then
+        lib.notify(source, { title = 'Storage', description = 'Player not found', type = 'error' })
+        return false
+    end
+
+    -- Check bank balance (framework-agnostic via bridge)
+    local bankBalance = 0
+    if Player.getAccount then
+        -- ESX style
+        local account = Player.getAccount('bank')
+        bankBalance = account and (account.money or account) or 0
+    elseif Player.Functions and Player.Functions.GetMoney then
+        -- QBCore style
+        bankBalance = Player.Functions.GetMoney('bank') or 0
+    elseif Player.getMoney then
+        -- ND style
+        bankBalance = Player.getMoney('bank') or 0
+    else
+        -- Fallback: check for bank item in inventory
+        bankBalance = exports.ox_inventory:GetItemCount(source, 'money') or 0
+    end
+
+    if bankBalance < price then
+        lib.notify(source,
+            {
+                title = 'Storage',
+                description = 'Insufficient bank funds ($' .. math.groupdigits(price) .. ' required)',
+                type =
+                'error'
+            })
+        return false
+    end
+
+    -- Deduct from bank (framework-agnostic)
+    local success = false
+    if Player.removeAccountMoney then
+        -- ESX style
+        Player.removeAccountMoney('bank', price, 'Storage purchase')
+        success = true
+    elseif Player.Functions and Player.Functions.RemoveMoney then
+        -- QBCore style
+        success = Player.Functions.RemoveMoney('bank', price, 'Storage purchase')
+    elseif Player.deductMoney then
+        -- ND style
+        success = Player.deductMoney('bank', price, 'Storage purchase')
+    else
+        -- Fallback: remove cash item
+        success = exports.ox_inventory:RemoveItem(source, 'money', price)
+    end
+
+    if success then
+        -- Grant the safe item
+        local itemName = itemNames[stashType]
+        exports.ox_inventory:AddItem(source, itemName, 1)
+        
+        lib.notify(source, {
+            title = 'Bank Payment',
+            description = ('Deducted $%s from bank for storage. Check your inventory!'):format(math.groupdigits(price)),
+            type = 'success'
+        })
+        return true
+    else
+        lib.notify(source, { title = 'Storage', description = 'Payment failed', type = 'error' })
+        return false
+    end
+end)
+
+-- Save stash event (called after placement)
+RegisterNetEvent('ox_inventory:saveStash', function(data)
+    local source = source
+    local identifier = GetPlayerIdentifier(source)
+
+    if not identifier then return end
+
+    data.owner = identifier
+    local stash = CreateStash(data)
+
+    -- Remove the corresponding safe item from inventory
+    local itemNames = {
+        small = 'safe_small',
+        medium = 'safe_medium',
+        large = 'safe_large',
+        xxl = 'sf_prop_v_43_safe_s_bk_01a'
+    }
+    local itemName = itemNames[data.type]
+    if itemName then
+        exports.ox_inventory:RemoveItem(source, itemName, 1)
+    end
+
+    -- Register the stash with ox_inventory
+    exports.ox_inventory:RegisterStash(stash.id, stash.id, stash.slots, stash.maxWeight, stash.owner)
+
+    -- Notify nearby players to load the new stash
+    local coords = data.coords
+    local players = GetPlayers()
+    for _, playerId in ipairs(players) do
+        local ped = GetPlayerPed(tonumber(playerId))
+        if ped and ped ~= 0 then
+            local playerCoords = GetEntityCoords(ped)
+            if #(vector3(coords.x, coords.y, coords.z) - playerCoords) < 150.0 then
+                TriggerClientEvent('ox_inventory:loadStashes', tonumber(playerId), { stash })
+            end
+        end
+    end
+
+end)
+
+-- Open stash event
+RegisterNetEvent('ox_inventory:openStash', function(stashId)
+    local source = source
+    local stash = GetStash(stashId)
+
+    if not stash then
+        lib.notify(source, { title = 'Storage', description = 'Safe not found', type = 'error' })
+        return
+    end
+
+    if not CanAccessStash(source, stash) then
+        lib.notify(source, { title = 'Storage', description = 'This is not your safe', type = 'error' })
+        return
+    end
+
+    -- Open the stash inventory
+    exports.ox_inventory:forceOpenInventory(source, 'stash', {
+        id = stashId,
+        slots = stash.slots,
+        maxWeight = stash.maxWeight,
+        owner = stash.owner
+    })
+end)
+
+-- Delete stash event
+RegisterNetEvent('ox_inventory:deleteStash', function(stashId)
+    local source = source
+    local stash = GetStash(stashId)
+
+    if stash and CanAccessStash(source, stash) then
+        DeleteStash(stashId)
+        lib.notify(source, { title = 'Storage', description = 'Safe removed', type = 'success' })
+
+        -- Notify all players to remove the stash prop
+        TriggerClientEvent('ox_inventory:removeStash', -1, stashId)
+    end
+end)
+
+-- Player joining - send their stashes
+RegisterNetEvent('ox_inventory:requestStashes', function()
+    local source = source
+    local identifier = GetPlayerIdentifier(source)
+
+    if not identifier then return end
+
+    -- Get player's own stashes
+    local playerStashes = GetPlayerStashes(identifier)
+
+    -- Also get nearby stashes from other players (they can see but not open)
+    local ped = GetPlayerPed(source)
+    if ped and ped ~= 0 then
+        local coords = GetEntityCoords(ped)
+        local nearbyStashes = GetStashesInRange(coords, 150.0)
+
+        -- Merge with player stashes (avoiding duplicates)
+        local stashIds = {}
+        for _, stash in ipairs(playerStashes) do
+            stashIds[stash.id] = true
+        end
+        for _, stash in ipairs(nearbyStashes) do
+            if not stashIds[stash.id] then
+                playerStashes[#playerStashes + 1] = stash
+            end
+        end
+    end
+
+    if #playerStashes > 0 then
+        TriggerClientEvent('ox_inventory:loadStashes', source, playerStashes)
+    end
+end)
+
+-- Callback to get stash count
+lib.callback.register('ox_inventory:getStashCount', function(source)
+    local identifier = GetPlayerIdentifier(source)
+    if not identifier then return 0 end
+
+    local stashes = GetPlayerStashes(identifier)
+    return #stashes
+end)
+
+-- Callback to get player identifier (for client-side owner checks)
+lib.callback.register('ox_inventory:getPlayerIdentifier', function(source)
+    return GetPlayerIdentifier(source)
+end)
+
+-- Robbery system
+local robberyColdowns = {}       -- { [stashId] = timestamp }
+local ROBBERY_COOLDOWN = 1800000 -- 30 minutes in ms
+
+RegisterNetEvent('ox_inventory:robStash', function(stashId)
+    local source = source
+    local identifier = GetPlayerIdentifier(source)
+    local stash = GetStash(stashId)
+
+    if not stash then
+        lib.notify(source, { title = 'Robbery', description = 'Safe not found', type = 'error' })
+        return
+    end
+
+    -- Can't rob your own safe
+    if stash.owner == identifier then
+        lib.notify(source, { title = 'Robbery', description = 'This is your own safe!', type = 'error' })
+        return
+    end
+
+    -- Check cooldown
+    local currentTime = os.time() * 1000
+    if robberyColdowns[stashId] and (currentTime - robberyColdowns[stashId]) < ROBBERY_COOLDOWN then
+        local remaining = math.floor((ROBBERY_COOLDOWN - (currentTime - robberyColdowns[stashId])) / 60000)
+        lib.notify(source, {
+            title = 'Robbery',
+            description = ('This safe was recently robbed. Try again in %d minutes.'):format(remaining),
+            type = 'error'
+        })
+        return
+    end
+
+    -- Check if player has a lockpick
+    local hasLockpick = exports.ox_inventory:GetItemCount(source, 'lockpick') > 0 or
+        exports.ox_inventory:GetItemCount(source, 'advanced_lockpick') > 0 or
+        exports.ox_inventory:GetItemCount(source, 'master_lockpick') > 0
+
+    if not hasLockpick then
+        lib.notify(source, { title = 'Robbery', description = 'You need a lockpick to rob this safe', type = 'error' })
+        return
+    end
+
+    -- Start robbery minigame via client
+    TriggerClientEvent('ox_inventory:startSafeRobbery', source, {
+        stashId = stashId,
+        slots = stash.slots,
+        maxWeight = stash.maxWeight,
+        difficulty = stash.type -- small = easier, large = harder
+    })
+end)
+
+-- Robbery success callback
+lib.callback.register('ox_inventory:completeRobbery', function(source, stashId, success)
+    local stash = GetStash(stashId)
+    if not stash then return false end
+
+    -- Consume lockpick (chance to break)
+    local breakChance = math.random(100)
+    if breakChance <= 40 then -- 40% chance to break lockpick
+        local lockpickTypes = { 'master_lockpick', 'advanced_lockpick', 'lockpick' }
+        for _, lockpickType in ipairs(lockpickTypes) do
+            if exports.ox_inventory:GetItemCount(source, lockpickType) > 0 then
+                exports.ox_inventory:RemoveItem(source, lockpickType, 1)
+                lib.notify(source, { title = 'Lockpick', description = 'Your lockpick broke!', type = 'error' })
+                break
+            end
+        end
+    end
+
+    if success then
+        -- Set cooldown
+        robberyColdowns[stashId] = os.time() * 1000
+
+        -- Open the stash for the robber (read-only or limited time)
+        exports.ox_inventory:forceOpenInventory(source, 'stash', {
+            id = stashId,
+            slots = stash.slots,
+            maxWeight = stash.maxWeight,
+            owner = false -- Allow access without ownership
+        })
+
+        -- Alert police (if you have a dispatch system)
+        TriggerEvent('ox_inventory:safeRobberyAlert', {
+            coords = stash.coords,
+            robber = source
+        })
+
+        lib.notify(source, {
+            title = '🔓 Safe Cracked!',
+            description = 'You cracked the safe! Take what you can.',
+            type = 'success',
+            duration = 5000
+        })
+
+        return true
+    else
+        lib.notify(source, { title = 'Robbery Failed', description = 'You failed to crack the safe', type = 'error' })
+        return false
+    end
+end)
+
+-- ==========================================
+-- PIN SECURITY FUNCTIONS
+-- ==========================================
+
+-- Set or update PIN for a stash
+local function SetStashPin(stashId, pin)
+    MySQL.update('UPDATE ox_inventory_stashes SET pin = ?, failed_attempts = 0, lockout_until = NULL WHERE id = ?',
+        { pin, stashId })
+
+    if stashCache[stashId] then
+        stashCache[stashId].pin = pin
+        stashCache[stashId].failedAttempts = 0
+        stashCache[stashId].lockoutUntil = nil
+    end
+    return true
+end
+
+-- Remove PIN from a stash
+local function RemoveStashPin(stashId)
+    MySQL.update('UPDATE ox_inventory_stashes SET pin = NULL, failed_attempts = 0, lockout_until = NULL WHERE id = ?',
+        { stashId })
+
+    if stashCache[stashId] then
+        stashCache[stashId].pin = nil
+        stashCache[stashId].failedAttempts = 0
+        stashCache[stashId].lockoutUntil = nil
+    end
+    return true
+end
+
+-- Verify PIN and handle failed attempts
+local function VerifyStashPin(stashId, inputPin)
+    local stash = stashCache[stashId]
+    if not stash or not stash.pin then
+        return true -- No PIN set
+    end
+
+    -- Check lockout
+    if stash.lockoutUntil then
+        local lockoutTime = stash.lockoutUntil
+        if os.time() < lockoutTime then
+            return false, 'locked', lockoutTime - os.time()
+        else
+            -- Lockout expired, reset
+            stash.failedAttempts = 0
+            stash.lockoutUntil = nil
+        end
+    end
+
+    if stash.pin == inputPin then
+        -- Correct PIN - reset failed attempts
+        stash.failedAttempts = 0
+        MySQL.update('UPDATE ox_inventory_stashes SET failed_attempts = 0 WHERE id = ?', { stashId })
+        return true
+    else
+        -- Wrong PIN
+        stash.failedAttempts = (stash.failedAttempts or 0) + 1
+
+        if stash.failedAttempts >= 3 then
+            -- Lockout for 5 minutes
+            stash.lockoutUntil = os.time() + 300
+            MySQL.update(
+                'UPDATE ox_inventory_stashes SET failed_attempts = ?, lockout_until = FROM_UNIXTIME(?) WHERE id = ?',
+                { stash.failedAttempts, stash.lockoutUntil, stashId })
+            return false, 'locked', 300
+        else
+            MySQL.update('UPDATE ox_inventory_stashes SET failed_attempts = ? WHERE id = ?',
+                { stash.failedAttempts, stashId })
+            return false, 'wrong', 3 - stash.failedAttempts
+        end
+    end
+end
+
+-- ==========================================
+-- SHARED ACCESS FUNCTIONS
+-- ==========================================
+
+-- Get shared access list for a stash
+local function GetSharedAccess(stashId)
+    local result = MySQL.scalar.await('SELECT shared_access FROM ox_inventory_stashes WHERE id = ?', { stashId })
+    if result then
+        return json.decode(result) or {}
+    end
+    return {}
+end
+
+-- Add player to shared access
+local function AddSharedAccess(stashId, playerId, playerName)
+    local sharedAccess = GetSharedAccess(stashId)
+
+    -- Check if already exists
+    for _, user in ipairs(sharedAccess) do
+        if user.id == playerId then
+            return false, 'already_exists'
+        end
+    end
+
+    table.insert(sharedAccess, {
+        id = playerId,
+        name = playerName or ('Player ' .. playerId),
+        addedAt = os.date('%Y-%m-%d %H:%M')
+    })
+
+    MySQL.update('UPDATE ox_inventory_stashes SET shared_access = ? WHERE id = ?', { json.encode(sharedAccess), stashId })
+
+    if stashCache[stashId] then
+        stashCache[stashId].sharedAccess = sharedAccess
+    end
+
+    return true
+end
+
+-- Remove player from shared access
+local function RemoveSharedAccess(stashId, playerId)
+    local sharedAccess = GetSharedAccess(stashId)
+
+    for i, user in ipairs(sharedAccess) do
+        if user.id == playerId then
+            table.remove(sharedAccess, i)
+            MySQL.update('UPDATE ox_inventory_stashes SET shared_access = ? WHERE id = ?',
+                { json.encode(sharedAccess), stashId })
+
+            if stashCache[stashId] then
+                stashCache[stashId].sharedAccess = sharedAccess
+            end
+
+            return true
+        end
+    end
+
+    return false, 'not_found'
+end
+
+-- Check if player has access (owner or shared)
+local function HasStashAccess(source, stashId)
+    local stash = stashCache[stashId]
+    if not stash then return false end
+
+    local identifier = GetPlayerIdentifier(source)
+
+    -- Owner always has access
+    if stash.owner == identifier then
+        return true, true -- hasAccess, isOwner
+    end
+
+    -- Check shared access
+    local sharedAccess = stash.sharedAccess or GetSharedAccess(stashId)
+    for _, user in ipairs(sharedAccess) do
+        if user.id == identifier then
+            return true, false -- hasAccess, isOwner
+        end
+    end
+
+    return false, false
+end
+
+-- ==========================================
+-- NET EVENTS FOR PIN/ACCESS
+-- ==========================================
+
+RegisterNetEvent('ox_inventory:setStashPin', function(stashId, pin)
+    local source = source
+    local hasAccess, isOwner = HasStashAccess(source, stashId)
+
+    if not isOwner then
+        lib.notify(source, { title = 'Stash', description = 'Only the owner can set PIN', type = 'error' })
+        return
+    end
+
+    if not pin or #pin ~= 4 or not pin:match('^%d+$') then
+        lib.notify(source, { title = 'Stash', description = 'PIN must be 4 digits', type = 'error' })
+        return
+    end
+
+    SetStashPin(stashId, pin)
+    lib.notify(source, { title = 'Stash', description = 'PIN has been set', type = 'success' })
+end)
+
+RegisterNetEvent('ox_inventory:removeStashPin', function(stashId)
+    local source = source
+    local hasAccess, isOwner = HasStashAccess(source, stashId)
+
+    if not isOwner then
+        lib.notify(source, { title = 'Stash', description = 'Only the owner can remove PIN', type = 'error' })
+        return
+    end
+
+    RemoveStashPin(stashId)
+    lib.notify(source, { title = 'Stash', description = 'PIN has been removed', type = 'success' })
+end)
+
+RegisterNetEvent('ox_inventory:verifyStashPin', function(stashId, pin, callback)
+    local source = source
+    local success, reason, value = VerifyStashPin(stashId, pin)
+
+    TriggerClientEvent('ox_inventory:pinVerifyResult', source, stashId, success, reason, value)
+end)
+
+RegisterNetEvent('ox_inventory:addSharedAccess', function(stashId, targetId, targetName)
+    local source = source
+    local hasAccess, isOwner = HasStashAccess(source, stashId)
+
+    if not isOwner then
+        lib.notify(source, { title = 'Stash', description = 'Only the owner can manage access', type = 'error' })
+        return
+    end
+
+    local success, err = AddSharedAccess(stashId, targetId, targetName)
+    if success then
+        lib.notify(source,
+            { title = 'Stash', description = 'Access granted to ' .. (targetName or targetId), type = 'success' })
+    else
+        lib.notify(source, { title = 'Stash', description = 'Player already has access', type = 'error' })
+    end
+end)
+
+RegisterNetEvent('ox_inventory:removeSharedAccess', function(stashId, targetId)
+    local source = source
+    local hasAccess, isOwner = HasStashAccess(source, stashId)
+
+    if not isOwner then
+        lib.notify(source, { title = 'Stash', description = 'Only the owner can manage access', type = 'error' })
+        return
+    end
+
+    local success = RemoveSharedAccess(stashId, targetId)
+    if success then
+        lib.notify(source, { title = 'Stash', description = 'Access revoked', type = 'success' })
+    else
+        lib.notify(source, { title = 'Stash', description = 'Player not found', type = 'error' })
+    end
+end)
+
+-- Get stash security info for UI
+lib.callback.register('ox_inventory:getStashSecurity', function(source, stashId)
+    local stash = stashCache[stashId]
+    if not stash then return nil end
+
+    local hasAccess, isOwner = HasStashAccess(source, stashId)
+    if not hasAccess then return nil end
+
+    local sharedAccess = stash.sharedAccess or GetSharedAccess(stashId)
+
+    return {
+        stashId = stashId,
+        stashLabel = stash.label or ('Stash ' .. stashId),
+        hasPin = stash.pin ~= nil,
+        isOwner = isOwner,
+        sharedUsers = sharedAccess,
+        isLocked = stash.lockoutUntil and os.time() < stash.lockoutUntil,
+        lockoutTime = stash.lockoutUntil and math.max(0, stash.lockoutUntil - os.time()) or 0,
+        failedAttempts = stash.failedAttempts or 0,
+        maxAttempts = 3
+    }
+end)
+
+-- Update stash position (for move feature)
+local function UpdateStashPosition(stashId, coords, rotZ)
+    local stash = stashCache[stashId]
+    if not stash then return false end
+
+    -- Update in database
+    MySQL.update([[
+        UPDATE ox_inventory_stashes
+        SET coords_x = ?, coords_y = ?, coords_z = ?, rotation_z = ?
+        WHERE id = ?
+    ]], { coords.x, coords.y, coords.z, rotZ, stashId })
+
+    -- Update cache
+    stash.coords = { x = coords.x, y = coords.y, z = coords.z }
+    stash.rotation = stash.rotation or {}
+    stash.rotation.z = rotZ
+
+    return true
+end
+
+-- Server event: Update stash position
+RegisterNetEvent('ox_inventory:updateStashPosition', function(stashId, coords, rotZ)
+    local source = source
+    local identifier = GetPlayerIdentifier(source)
+
+    -- Validate ownership
+    local stash = stashCache[stashId]
+    if not stash then
+        lib.notify(source, { title = 'Stash', description = 'Stash not found', type = 'error' })
+        return
+    end
+
+    if stash.owner ~= identifier then
+        lib.notify(source, { title = 'Stash', description = 'You do not own this stash', type = 'error' })
+        return
+    end
+
+    if UpdateStashPosition(stashId, coords, rotZ) then
+        -- Notify all nearby players to update prop position
+        TriggerClientEvent('ox_inventory:updateStashProp', -1, stashId, coords, rotZ)
+    end
+end)
+
+-- Server event: Delete stash
+RegisterNetEvent('ox_inventory:deleteStash', function(stashId)
+    local source = source
+    local identifier = GetPlayerIdentifier(source)
+
+    -- Validate ownership
+    local stash = stashCache[stashId]
+    if not stash then
+        lib.notify(source, { title = 'Stash', description = 'Stash not found', type = 'error' })
+        return
+    end
+
+    if stash.owner ~= identifier then
+        lib.notify(source, { title = 'Stash', description = 'You do not own this stash', type = 'error' })
+        return
+    end
+
+    -- Delete the stash
+    if DeleteStash(stashId) then
+        -- Notify all clients to remove the prop
+        TriggerClientEvent('ox_inventory:removeStash', -1, stashId)
+
+        lib.notify(source, {
+            title = 'Stash Removed',
+            description = 'Your stash has been permanently deleted',
+            type = 'success'
+        })
+    else
+        lib.notify(source, { title = 'Stash', description = 'Failed to remove stash', type = 'error' })
+    end
+end)
+
+-- Exports
+exports('createPlayerStash', CreateStash)
+exports('deletePlayerStash', DeleteStash)
+exports('getPlayerStash', GetStash)
+exports('getPlayerStashes', GetPlayerStashes)
+exports('getAllStashes', function() return stashCache end)
+exports('setStashPin', SetStashPin)
+exports('removeStashPin', RemoveStashPin)
+exports('verifyStashPin', VerifyStashPin)
+exports('addSharedAccess', AddSharedAccess)
+exports('removeSharedAccess', RemoveSharedAccess)
+exports('hasStashAccess', HasStashAccess)
+exports('updateStashPosition', UpdateStashPosition)
+

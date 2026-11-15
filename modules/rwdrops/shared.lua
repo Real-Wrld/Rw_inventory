@@ -1,0 +1,213 @@
+--  REALWRLD Software® · ox_inventory · Item Drop Physics · shared
+-- ═════════════════════════════════════════════════════════════
+--
+--  Loaded by BOTH sides so the server default, the admin edit and the
+--  client all clamp `RWInv.Drops` identically, and so a prop-map
+--  entry (data/itemProps.lua or the admin KVP) has one normalised
+--  shape everywhere.
+-- ═════════════════════════════════════════════════════════════
+
+local Shared = {}
+
+---Defaults (= config.lua reference values, design/drops.md §3.1).
+Shared.DEFAULTS = {
+    enabled        = true,
+    mode           = 'scatter',
+    maxProps       = 6,
+    stackCopies    = 3,
+    stackMaxCount  = 10,
+    scatterRadius  = 0.45,
+    physics        = true,
+    keepPhysics    = true,
+    settleMs       = 2500,
+    placeOnGround  = true,
+    dropInFrontPhysicsOnly = true,
+    renderDistance = 30.0,
+    ringDistance   = 12.0,
+    promptDistance = 2.2,
+    maxPrompts     = 24,
+    maxTotalProps  = 60,
+    key            = 'E',
+    pickupMode     = 'take',
+    target         = true,
+    weaponProps    = true,
+    bagModel       = 'prop_med_bag_01b',
+    weaponRotation = { pitch = 0.0, roll = 90.0 },
+    lifetimeMinutes = 0,
+}
+
+---Keys whose change means active props must be despawned and respawned.
+Shared.SPAWN_KEYS = { 'mode', 'maxProps', 'stackCopies', 'stackMaxCount', 'scatterRadius', 'physics', 'keepPhysics', 'weaponProps', 'bagModel', 'weaponRotation' }
+
+local MODES = { scatter = true, item = true, bag = true }
+local PICKUP_MODES = { take = true, open = true }
+
+local function num(v, lo, hi, default, integer)
+    v = tonumber(v)
+    if v == nil then return default end
+    if v ~= v then return default end
+    if v < lo then v = lo elseif v > hi then v = hi end
+    if integer then return math.floor(v + 0.5) end
+    return v + 0.0
+end
+
+local function bool(v, default)
+    if type(v) == 'boolean' then return v end
+    return default
+end
+
+---Clamp a raw `RWInv.Drops` table (or the server-settings overlay) to
+---the ranges of design/drops.md §3.2. Unknown keys are dropped, wrong
+---types fall back to the default, `fallbackModel` is read as `bagModel`.
+---@param raw table?
+---@return table
+function Shared.sanitizeDropsConfig(raw)
+    raw = type(raw) == 'table' and raw or {}
+    local D = Shared.DEFAULTS
+    local out = {}
+
+    out.enabled = bool(raw.enabled, D.enabled)
+    out.mode = MODES[raw.mode] and raw.mode or D.mode
+    out.maxProps = num(raw.maxProps, 1, 12, D.maxProps, true)
+    out.stackCopies = num(raw.stackCopies, 1, 6, D.stackCopies, true)
+    out.stackMaxCount = num(raw.stackMaxCount, 1, 999, D.stackMaxCount, true)
+    out.scatterRadius = num(raw.scatterRadius, 0.0, 3.0, D.scatterRadius)
+    out.physics = bool(raw.physics, D.physics)
+    out.keepPhysics = bool(raw.keepPhysics, D.keepPhysics)
+    out.settleMs = num(raw.settleMs, 300, 10000, D.settleMs, true)
+    out.placeOnGround = bool(raw.placeOnGround, D.placeOnGround)
+    out.dropInFrontPhysicsOnly = bool(raw.dropInFrontPhysicsOnly, D.dropInFrontPhysicsOnly)
+    out.renderDistance = num(raw.renderDistance, 5.0, 120.0, D.renderDistance)
+    out.ringDistance = math.min(out.renderDistance, num(raw.ringDistance, 1.0, 120.0, D.ringDistance))
+    out.promptDistance = math.min(out.ringDistance, num(raw.promptDistance, 0.5, 120.0, D.promptDistance))
+    out.maxPrompts = num(raw.maxPrompts, 4, 48, D.maxPrompts, true)
+    out.maxTotalProps = num(raw.maxTotalProps, 6, 200, D.maxTotalProps, true)
+    -- one drop (its props + the bag) must always fit under the total cap,
+    -- or it retries every 2 s forever and shows only the marker
+    if out.maxTotalProps < out.maxProps + 1 then out.maxTotalProps = out.maxProps + 1 end
+
+    local key = type(raw.key) == 'string' and raw.key:upper() or D.key
+    if #key < 1 or #key > 16 or not key:match('^[%w_]+$') then key = D.key end
+    out.key = key
+
+    out.pickupMode = PICKUP_MODES[raw.pickupMode] and raw.pickupMode or D.pickupMode
+    out.weaponProps = bool(raw.weaponProps, D.weaponProps)
+    out.target = bool(raw.target, D.target)
+
+    local bag = raw.bagModel or raw.fallbackModel
+    if type(bag) ~= 'string' or #bag > 64 or not bag:match('^[%w_]+$') then bag = D.bagModel end
+    out.bagModel = bag
+
+    local rot = type(raw.weaponRotation) == 'table' and raw.weaponRotation or {}
+    local pitch = rot.pitch
+    local roll = rot.roll
+    if pitch == nil then pitch = raw.weaponRotationPitch end
+    if roll == nil then roll = raw.weaponRotationRoll end
+    out.weaponRotation = {
+        pitch = num(pitch, -180.0, 180.0, D.weaponRotation.pitch),
+        roll = num(roll, -180.0, 180.0, D.weaponRotation.roll),
+    }
+
+    out.lifetimeMinutes = num(raw.lifetimeMinutes, 0, 1440, D.lifetimeMinutes, true)
+
+    return out
+end
+
+local MODEL_RE = '^[%w_]+$'
+
+local function modelList(v)
+    local out = {}
+    if type(v) == 'string' then
+        v = { v }
+    elseif type(v) ~= 'table' then
+        return out
+    end
+    for i = 1, #v do
+        local m = v[i]
+        if type(m) == 'string' and #m > 0 and #m <= 64 and m:match(MODEL_RE) then
+            out[#out + 1] = m
+            if #out >= 8 then break end
+        end
+    end
+    return out
+end
+
+local function vec(v, lim)
+    if type(v) ~= 'table' then return nil end
+    local x, y, z = tonumber(v.x), tonumber(v.y), tonumber(v.z)
+    if x == nil and y == nil and z == nil then return nil end
+    return {
+        x = num(x, -lim, lim, 0.0),
+        y = num(y, -lim, lim, 0.0),
+        z = num(z, -lim, lim, 0.0),
+    }
+end
+
+---Normalise one prop-map value into the shape of design/drops.md §5.2.
+---  'model'                  → { model = {'model'}, bagWhenUnknown = true }
+---  { 'a', 'b' }             → { model = {'a','b'}, bagWhenUnknown = true }
+---  { model = …, offset = …, rotation = …, physics = …, bag = …, bagWhenUnknown = …, stackLimit = … }
+---Anything else → nil (entry ignored).
+---@param raw any
+---@return table? entry
+function Shared.normalizeEntry(raw)
+    local t = type(raw)
+
+    if t == 'string' then
+        local models = modelList(raw)
+        if #models == 0 then return nil end
+        return { model = models, bagWhenUnknown = true }
+    end
+
+    if t ~= 'table' then return nil end
+
+    if raw.model == nil and raw.bag ~= true then
+        local models = modelList(raw)
+        if #models == 0 then return nil end
+        return { model = models, bagWhenUnknown = true }
+    end
+
+    local entry = { model = modelList(raw.model), bagWhenUnknown = true }
+    if raw.bag == true then entry.bag = true end
+    if #entry.model == 0 and not entry.bag then return nil end
+
+    entry.offset = vec(raw.offset, 2.0)
+    entry.rotation = vec(raw.rotation, 360.0)
+    if type(raw.physics) == 'boolean' then entry.physics = raw.physics end
+    if raw.bagWhenUnknown == false then entry.bagWhenUnknown = false end
+    if raw.stackLimit ~= nil then
+        entry.stackLimit = num(raw.stackLimit, 0, 12, nil, true)
+    end
+
+    return entry
+end
+
+---Normalise a whole map ({ [item] = raw }); `__categories` is skipped and
+---returned separately (only `.default` is meaningful).
+---@param raw table?
+---@return table<string, table> items, table categories
+function Shared.normalizeMap(raw)
+    local items, cats = {}, {}
+    if type(raw) ~= 'table' then return items, cats end
+
+    for k, v in pairs(raw) do
+        if k == '__categories' then
+            if type(v) == 'table' then cats = v end
+        elseif type(k) == 'string' then
+            local entry = Shared.normalizeEntry(v)
+            if entry then items[k] = entry end
+        end
+    end
+
+    return items, cats
+end
+
+---Deep copy of a normalised entry / map (payloads never alias state).
+function Shared.clone(v)
+    if type(v) ~= 'table' then return v end
+    local o = {}
+    for k, x in pairs(v) do o[k] = Shared.clone(x) end
+    return o
+end
+
+return Shared

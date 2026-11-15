@@ -1,0 +1,676 @@
+--  REALWRLD Software® · ox_inventory · Item Drop Physics · server
+-- ═════════════════════════════════════════════════════════════
+--
+--  Three jobs (design/drops.md §2):
+--    • the one-key pickup callback: move ONLY the item the player aimed
+--      at from the drop into their pockets (server-authoritative);
+--    • the effective config service (config.lua defaults + admin edits
+--      through modules/rwserversettings), broadcast without restart;
+--    • the prop-map service: data/itemProps.lua seed + KVP overrides
+--      (`rw:dropProps`), versioned, admin-editable, import/export.
+-- ═════════════════════════════════════════════════════════════
+
+if not lib then return end
+
+local Shared = require 'modules.rwdrops.shared'
+local conf = require 'modules.rwconfig.shared'.Get()
+local featureOn = type(conf.Features) ~= 'table' or conf.Features.itemDrops ~= false
+
+if not featureOn then
+    exports('GetDropsConfig', function() return { enabled = false } end)
+    -- nobody listens for updateDropItems: stop the per-change broadcast
+    require('modules.inventory.server').dropItemsSync = false
+    return
+end
+
+local Inventory = require 'modules.inventory.server'
+local Items = require 'modules.items.server'
+local TriggerEventHooks = require 'modules.hooks.server'
+local okAdmin, Admin = pcall(require, 'modules.rwadmin.server')
+local okLog, Log = pcall(require, 'modules.rwlogs.server')
+local Settings -- modules.rwserversettings.server, resolved lazily
+
+okAdmin = okAdmin and type(Admin) == 'table' and type(Admin.register) == 'function'
+okLog = okLog and type(Log) == 'table' and type(Log.record) == 'function'
+
+local Drops = {}
+local KVP_KEY = 'rw:dropProps'
+local KVP_LIMIT = 200 * 1024
+
+local state = {
+    cfg = Shared.sanitizeDropsConfig(conf.Drops or conf.ItemDrops),
+    enabled = true,
+}
+
+-- ─── effective config ───────────────────────────────────────
+local SETTINGS_PATHS = {
+    'enabled', 'mode', 'maxProps', 'stackCopies', 'stackMaxCount', 'scatterRadius', 'physics', 'keepPhysics',
+    'settleMs', 'placeOnGround', 'dropInFrontPhysicsOnly', 'renderDistance', 'ringDistance', 'promptDistance',
+    'maxPrompts', 'maxTotalProps', 'key', 'pickupMode', 'weaponProps', 'bagModel', 'lifetimeMinutes',
+}
+
+local function resolveSettings()
+    if Settings ~= nil then return Settings end
+    local ok, mod = pcall(require, 'modules.rwserversettings.server')
+    Settings = ok and type(mod) == 'table' and type(mod.get) == 'function' and mod or false
+    return Settings
+end
+
+-- Admin overrides on top of config.lua + server settings (drops.setConfig,
+-- admin panel "Ground drops"). Persisted in KVP; scalar keys only.
+local CFG_KVP = 'rw:dropsConfig'
+local CFG_KEYS = {}
+for _, k in ipairs(SETTINGS_PATHS) do CFG_KEYS[k] = true end
+CFG_KEYS.fallbackModel, CFG_KEYS.weaponRotationPitch, CFG_KEYS.weaponRotationRoll = true, true, true
+local cfgOverrides = {}
+do
+    local raw = GetResourceKvpString(CFG_KVP)
+    local ok, doc = pcall(json.decode, raw or '')
+    if ok and type(doc) == 'table' and type(doc.overrides) == 'table' then
+        for k, v in pairs(doc.overrides) do
+            if CFG_KEYS[k] and (type(v) == 'boolean' or type(v) == 'number' or type(v) == 'string') then cfgOverrides[k] = v end
+        end
+    end
+end
+
+local function rawConfig()
+    local base = conf.Drops or conf.ItemDrops or {}
+    local raw = {}
+    for k, v in pairs(base) do raw[k] = v end
+
+    local S = resolveSettings()
+    if S then
+        for _, key in ipairs(SETTINGS_PATHS) do
+            local v = S.get('drops.' .. key)
+            if v ~= nil then raw[key] = v end
+        end
+        local bag = S.get('drops.fallbackModel')
+        if raw.bagModel == nil and bag ~= nil then raw.bagModel = bag end
+        local pitch, roll = S.get('drops.weaponRotationPitch'), S.get('drops.weaponRotationRoll')
+        if pitch ~= nil or roll ~= nil then
+            local rot = type(raw.weaponRotation) == 'table' and raw.weaponRotation or {}
+            raw.weaponRotation = { pitch = pitch ~= nil and pitch or rot.pitch, roll = roll ~= nil and roll or rot.roll }
+        end
+    end
+
+    -- admin overrides win over both
+    for k, v in pairs(cfgOverrides) do
+        if k == 'weaponRotationPitch' or k == 'weaponRotationRoll' then
+            local rot = type(raw.weaponRotation) == 'table' and raw.weaponRotation or {}
+            raw.weaponRotation = { pitch = k == 'weaponRotationPitch' and v or rot.pitch, roll = k == 'weaponRotationRoll' and v or rot.roll }
+        elseif k == 'fallbackModel' then
+            raw.bagModel = v
+        else
+            raw[k] = v
+        end
+    end
+
+    return raw
+end
+
+local function applyRuntimeState()
+    state.enabled = featureOn and state.cfg.enabled == true
+    Inventory.dropItemsSync = state.enabled
+    Inventory.DropClearTime = state.cfg.lifetimeMinutes > 0 and state.cfg.lifetimeMinutes * 60 or Inventory.ClearTime
+end
+
+---Item maps of every drop, recomputed from the inventories. While drops are
+---classic bags (runtime switch off) nothing keeps them current, so turning
+---item props back on sends them fresh — no prop for an item already taken.
+---@return table<string, table<string, number>>
+local function resyncDropItems()
+    local out = {}
+
+    for dropId, record in pairs(Inventory.Drops) do
+        local inv = Inventory(dropId)
+
+        if inv and inv.type == 'drop' then
+            record.items = Inventory.DropItems(inv)
+            out[dropId] = record.items
+        end
+    end
+
+    return out
+end
+
+---Recompute the effective config and broadcast it (live hook for every
+---`drops.*` server-settings path).
+function Drops.refreshConfig()
+    local wasEnabled = state.enabled
+    state.cfg = Shared.sanitizeDropsConfig(rawConfig())
+    applyRuntimeState()
+
+    local payload = { enabled = state.enabled, config = state.cfg }
+    if state.enabled and not wasEnabled then payload.dropItems = resyncDropItems() end
+
+    TriggerClientEvent('ox_inventory:rwDropsConfig', -1, payload)
+end
+
+applyRuntimeState()
+SetTimeout(0, function()
+    state.cfg = Shared.sanitizeDropsConfig(rawConfig())
+    applyRuntimeState()
+end)
+
+exports('GetDropsConfig', function() return state.cfg end)
+
+-- ─── admin config service (drops.getConfig / drops.setConfig) ──
+local function scalars(t)
+    local out = {}
+    for k, v in pairs(t or {}) do
+        if type(v) == 'boolean' or type(v) == 'number' or type(v) == 'string' then out[k] = v end
+    end
+    return out
+end
+
+---Effective values + config.lua defaults + the admin overrides (admin-logs / drops §2.6).
+local function getConfig()
+    local ov = {}
+    for k, v in pairs(cfgOverrides) do ov[k] = v end
+    return { keys = scalars(state.cfg), defaults = scalars(Shared.sanitizeDropsConfig(conf.Drops or conf.ItemDrops)), overrides = ov }
+end
+
+---`{ overrides = { key = value }, clear = { key, ... } }` → persist, recompute, broadcast.
+local function setConfig(src, payload)
+    local merged = {}
+    for k, v in pairs(cfgOverrides) do merged[k] = v end
+    local changed = 0
+    if type(payload.clear) == 'table' then
+        for _, k in ipairs(payload.clear) do
+            if type(k) == 'string' and merged[k] ~= nil then merged[k] = nil changed = changed + 1 end
+        end
+    end
+    if type(payload.overrides) == 'table' then
+        for k, v in pairs(payload.overrides) do
+            if type(k) ~= 'string' or not CFG_KEYS[k] then return false, 'bad_payload' end
+            if v == false and k ~= 'enabled' and k ~= 'physics' and k ~= 'keepPhysics' and k ~= 'placeOnGround'
+                and k ~= 'dropInFrontPhysicsOnly' and k ~= 'stackCopies' and k ~= 'weaponProps' then
+                -- `false` on a non-bool key = clear (legacy contract)
+                if merged[k] ~= nil then merged[k] = nil changed = changed + 1 end
+            elseif v == '__clear' then
+                if merged[k] ~= nil then merged[k] = nil changed = changed + 1 end
+            elseif type(v) == 'boolean' or type(v) == 'number' or (type(v) == 'string' and #v <= 64) then
+                if merged[k] ~= v then merged[k] = v changed = changed + 1 end
+            else
+                return false, 'bad_payload'
+            end
+        end
+    end
+    -- validate through the sanitizer before persisting
+    local probe = {}
+    for k, v in pairs(conf.Drops or conf.ItemDrops or {}) do probe[k] = v end
+    for k, v in pairs(merged) do probe[k] = v end
+    local ok = pcall(Shared.sanitizeDropsConfig, probe)
+    if not ok then return false, 'bad_payload' end
+
+    cfgOverrides = merged
+    SetResourceKvp(CFG_KVP, json.encode({ version = 1, updatedAt = os.time(), overrides = cfgOverrides }))
+    Drops.refreshConfig()
+    if okLog and changed > 0 then
+        pcall(Log.record, 'server_settings_edit', { actor = src, extra = { changed = changed, overrides = cfgOverrides } })
+    end
+    local res = getConfig()
+    res.changed = changed
+    return res
+end
+
+Drops.getConfig = getConfig
+Drops.setConfig = setConfig
+exports('SetDropsConfig', function(payload) return setConfig(0, type(payload) == 'table' and payload or {}) end)
+
+-- ─── prop map service (D6) ──────────────────────────────────
+-- a data/ folder kept from 3.0-3.3 has no itemProps.lua: lib.load raises, and
+-- that used to abort the whole inventory
+local seed, seedCategories
+do
+    local ok, seedMap = pcall(lib.load, 'data.itemProps')
+    seed, seedCategories = Shared.normalizeMap(ok and seedMap or {})
+end
+local seedCount = 0
+for _ in pairs(seed) do seedCount = seedCount + 1 end
+
+local overrides = {}      -- item -> entry | false
+local mapVersion = 0
+local effective = {}      -- item -> entry
+
+local function rebuildEffective()
+    effective = {}
+    for k, v in pairs(seed) do effective[k] = v end
+    for k, v in pairs(overrides) do
+        if v == false then effective[k] = nil else effective[k] = v end
+    end
+end
+
+local function loadOverrides()
+    local raw = GetResourceKvpString(KVP_KEY)
+    if not raw then return end
+
+    local ok, doc = pcall(json.decode, raw)
+    if not ok or type(doc) ~= 'table' then return end
+
+    mapVersion = math.floor(tonumber(doc.version) or 0)
+    overrides = {}
+
+    if type(doc.overrides) == 'table' then
+        for item, v in pairs(doc.overrides) do
+            if type(item) == 'string' then
+                if v == false then
+                    overrides[item] = false
+                else
+                    local entry = Shared.normalizeEntry(v)
+                    if entry then overrides[item] = entry end
+                end
+            end
+        end
+    end
+end
+
+---@return boolean ok, string? reason
+local function saveOverrides()
+    local doc = json.encode({ version = mapVersion, updatedAt = os.time(), overrides = overrides })
+    if #doc > KVP_LIMIT then return false, 'too_large' end
+    SetResourceKvp(KVP_KEY, doc)
+    return true
+end
+
+local function propMapPayload()
+    return {
+        version = mapVersion,
+        defaults = {
+            bagModel = state.cfg.bagModel or (type(seedCategories.default) == 'string' and seedCategories.default) or Shared.DEFAULTS.bagModel,
+            weaponRotation = { pitch = state.cfg.weaponRotation.pitch, roll = state.cfg.weaponRotation.roll },
+        },
+        items = Shared.clone(effective),
+    }
+end
+
+local function broadcastPropMap()
+    TriggerClientEvent('ox_inventory:rwDropsPropMap', -1, propMapPayload())
+end
+
+---Persist a set of pending overrides in one write; on failure nothing changes.
+---@param apply fun()
+---@return boolean ok, string? reason
+local function commit(apply)
+    local backup, backupVersion = overrides, mapVersion
+    local copy = {}
+    for k, v in pairs(overrides) do copy[k] = v end
+    overrides = copy
+    apply()
+    mapVersion = mapVersion + 1
+
+    local ok, reason = saveOverrides()
+    if not ok then
+        overrides, mapVersion = backup, backupVersion
+        return false, reason
+    end
+
+    rebuildEffective()
+    broadcastPropMap()
+    return true
+end
+
+loadOverrides()
+rebuildEffective()
+
+exports('GetDropProps', function() return Shared.clone(effective) end)
+
+local ITEM_RE = '^[%w_%-]+$'
+
+local function validItemName(item)
+    return type(item) == 'string' and #item >= 1 and #item <= 64 and item:match(ITEM_RE) ~= nil and Items(item) ~= nil
+end
+
+local function sourceOf(item)
+    local s, o = seed[item] ~= nil, overrides[item] ~= nil
+    if s and o then return 'both' end
+    if o then return 'override' end
+    return 'seed'
+end
+
+local function propMapGet(_, payload)
+    payload = type(payload) == 'table' and payload or {}
+    local overrideCount = 0
+    for _ in pairs(overrides) do overrideCount = overrideCount + 1 end
+
+    local total = 0
+    for _ in pairs(effective) do total = total + 1 end
+
+    local res = {
+        version = mapVersion,
+        defaults = propMapPayload().defaults,
+        items = Shared.clone(effective),
+        seedCount = seedCount,
+        overrideCount = overrideCount,
+        total = total,
+    }
+
+    if payload.search ~= nil or payload.offset ~= nil or payload.limit ~= nil then
+        local search = type(payload.search) == 'string' and payload.search:sub(1, 64):lower() or nil
+        local offset = math.max(0, math.floor(tonumber(payload.offset) or 0))
+        local limit = math.min(200, math.max(1, math.floor(tonumber(payload.limit) or 50)))
+        local names = {}
+
+        for item in pairs(effective) do names[#names + 1] = item end
+        for item, v in pairs(overrides) do
+            if v == false and not effective[item] then names[#names + 1] = item end
+        end
+        table.sort(names)
+
+        local rows, matched = {}, 0
+        for i = 1, #names do
+            local item = names[i]
+            local data = Items(item)
+            local label = data and data.label or item
+            if not search or item:lower():find(search, 1, true) or label:lower():find(search, 1, true) then
+                matched = matched + 1
+                if matched > offset and #rows < limit then
+                    rows[#rows + 1] = { item = item, label = label, entry = Shared.clone(effective[item]) or false, source = sourceOf(item) }
+                end
+            end
+        end
+
+        res.rows = rows
+        res.total = matched
+    end
+
+    return res
+end
+
+local function decodeImport(payload)
+    if type(payload.map) == 'table' then return payload.map end
+    if type(payload.json) == 'string' then
+        if #payload.json > 256 * 1024 then return nil, 'too_large' end
+        local ok, doc = pcall(json.decode, payload.json)
+        if not ok or type(doc) ~= 'table' then return nil, 'invalid_json' end
+        if type(doc.items) == 'table' then return doc.items end
+        return doc
+    end
+    return nil, 'invalid_payload'
+end
+
+local function propMapSet(_, payload)
+    payload = type(payload) == 'table' and payload or {}
+    local op = payload.op
+
+    if op == 'upsert' then
+        if not validItemName(payload.item) then return false, 'invalid_item' end
+        local entry = Shared.normalizeEntry(payload.entry)
+        if not entry then return false, 'invalid_entry' end
+        local ok, reason = commit(function() overrides[payload.item] = entry end)
+        if not ok then return false, reason end
+        return { version = mapVersion, items = Shared.clone(effective) }
+    end
+
+    if op == 'delete' then
+        local item = payload.item
+        if type(item) ~= 'string' or not item:match(ITEM_RE) then return false, 'invalid_item' end
+        local ok, reason = commit(function()
+            if seed[item] ~= nil then overrides[item] = false else overrides[item] = nil end
+        end)
+        if not ok then return false, reason end
+        return { version = mapVersion, items = Shared.clone(effective) }
+    end
+
+    if op == 'reset' then
+        local item = payload.item
+        local ok, reason = commit(function()
+            if type(item) == 'string' then overrides[item] = nil else overrides = {} end
+        end)
+        if not ok then return false, reason end
+        return { version = mapVersion, items = Shared.clone(effective) }
+    end
+
+    if op == 'export' then
+        local doc = propMapPayload()
+        -- seed items removed by an override are exported as false, so an
+        -- import(replace) of the document reproduces the same effective map
+        for item, v in pairs(overrides) do
+            if v == false and doc.items[item] == nil then doc.items[item] = false end
+        end
+        return { version = mapVersion, json = json.encode({ version = doc.version, defaults = doc.defaults, items = doc.items }, { indent = true }) }
+    end
+
+    if op == 'import' then
+        local map, err = decodeImport(payload)
+        if not map then return false, err end
+
+        local count = 0
+        for _ in pairs(map) do count = count + 1 end
+        if count > 1000 then return false, 'too_many' end
+
+        local accepted, rejected, skipped = {}, {}, {}
+        for item, raw in pairs(map) do
+            if not validItemName(item) then
+                rejected[#rejected + 1] = { item = tostring(item), reason = 'invalid_item' }
+            elseif raw == false then
+                accepted[item] = false
+            else
+                local entry = Shared.normalizeEntry(raw)
+                if entry then
+                    -- every candidate model name must be syntactically valid
+                    local badModel = false
+                    if type(raw) == 'table' and raw.model ~= nil then
+                        local list = type(raw.model) == 'string' and { raw.model } or raw.model
+                        if type(list) ~= 'table' then
+                            badModel = true
+                        else
+                            for i = 1, #list do
+                                if type(list[i]) ~= 'string' or not list[i]:match('^[%w_]+$') then badModel = true end
+                            end
+                        end
+                    elseif type(raw) == 'string' then
+                        badModel = not raw:match('^[%w_]+$')
+                    elseif type(raw) == 'table' then
+                        for i = 1, #raw do
+                            if type(raw[i]) ~= 'string' or not raw[i]:match('^[%w_]+$') then badModel = true end
+                        end
+                    end
+                    if badModel then
+                        rejected[#rejected + 1] = { item = item, reason = 'invalid_model' }
+                    else
+                        accepted[item] = entry
+                    end
+                else
+                    rejected[#rejected + 1] = { item = item, reason = 'invalid_entry' }
+                end
+            end
+        end
+
+        local imported = 0
+        local ok, reason = commit(function()
+            if payload.mode == 'replace' then overrides = {} end
+            for item, entry in pairs(accepted) do
+                local same = entry ~= false and seed[item] ~= nil and json.encode(seed[item]) == json.encode(entry)
+                if same then
+                    skipped[#skipped + 1] = item
+                else
+                    overrides[item] = entry
+                    imported = imported + 1
+                end
+            end
+        end)
+        if not ok then return false, reason end
+
+        return { version = mapVersion, imported = imported, skipped = skipped, rejected = rejected }
+    end
+
+    return false, 'invalid_op'
+end
+
+if okAdmin then
+    Admin.register('propMapGet', propMapGet, {})
+    Admin.register('propMapSet', propMapSet, { write = true, audit = 'propmap_edit' })
+    Admin.register('drops.getConfig', function(src, p) return getConfig() end, {})
+    Admin.register('drops.setConfig', setConfig, { write = true, audit = 'server_settings_edit' })
+end
+
+Drops.propMapGet = propMapGet
+Drops.propMapSet = propMapSet
+
+-- ─── first sync ─────────────────────────────────────────────
+-- (the payload deep-clones the prop map: one answer per source per second)
+local lastSync = {}
+
+lib.callback.register('ox_inventory:rwDropsSync', function(source)
+    local now = GetGameTimer()
+    if source and source > 0 then
+        if lastSync[source] and now - lastSync[source] < 1000 then return end
+        lastSync[source] = now
+    end
+    return { enabled = state.enabled, config = state.cfg, propMap = propMapPayload() }
+end)
+
+-- ─── one-key pickup ─────────────────────────────────────────
+local lastPickup = {}
+
+AddEventHandler('playerDropped', function()
+    lastPickup[source] = nil
+    lastSync[source] = nil
+end)
+
+---@param source number
+---@param dropId string
+---@param names string[]|nil
+---@return boolean ok, number|string takenOrReason, number? left
+lib.callback.register('ox_inventory:rwDropsPickup', function(source, dropId, names)
+    if not state.enabled then return false, 'disabled' end
+
+    -- (os.clock is CPU time on Linux: 250 ms of it could be seconds of real time)
+    local now = GetGameTimer()
+    if lastPickup[source] and now - lastPickup[source] < 250 then return false, 'busy' end
+    lastPickup[source] = now
+
+    if type(dropId) ~= 'string' or not dropId:match('^drop%-%d+$') then return false end
+
+    if names ~= nil then
+        if type(names) ~= 'table' or #names > 16 then return false end
+        for i = 1, #names do
+            if type(names[i]) ~= 'string' or #names[i] > 64 then return false end
+        end
+    end
+
+    local drop = Inventory(dropId)
+    if not drop or drop.type ~= 'drop' then return false end
+
+    local player = Inventory(source)
+    if not player then return false end
+
+    local ped = GetPlayerPed(source)
+    local pedCoords = ped and ped ~= 0 and GetEntityCoords(ped)
+    if not pedCoords or not drop.coords then return false end
+    -- Reach: the prompt distance is measured to the PROP, and a live prop may
+    -- drift up to scatterRadius + 4 m from the drop's anchor before it is
+    -- pulled back; capped like upstream's drop open (10 m) plus that drift
+    -- (promptDistance itself can be admin-set to 120 m).
+    local reach = math.min(state.cfg.promptDistance + 2.0, 10.0) + (state.cfg.scatterRadius or 0) + 4.5
+    if #(pedCoords - drop.coords) > math.max(3.0, reach) then return false, 'far' end
+
+    local pstate = Player(source).state
+    if pstate.invBusy or pstate.dead then return false, 'busy' end
+
+    local record = Inventory.Drops[dropId]
+    if record and record.instance and Player(source).state.instance ~= record.instance then return false end
+
+    if type(drop.openedBy) == 'table' then
+        for id in pairs(drop.openedBy) do
+            if tonumber(id) ~= source then return false, 'busy' end
+        end
+    end
+
+    local wanted
+    if names then
+        wanted = {}
+        for i = 1, #names do wanted[names[i]] = true end
+    end
+
+    local slots = {}
+    for slot, data in pairs(drop.items or {}) do
+        if type(data) == 'table' and data.name and (not wanted or wanted[data.name]) then
+            slots[#slots + 1] = { slot = tonumber(slot) or data.slot, data = data }
+        end
+    end
+    table.sort(slots, function(a, b) return (a.slot or 0) < (b.slot or 0) end)
+
+    local taken, left = 0, 0
+    local takenMap, firstTakenName = {}, nil
+
+    for i = 1, #slots do
+        local entry = slots[i]
+        local data = entry.data
+        local total = data.count or 1
+        local count = total
+        local name = data.name
+
+        local hooks <close> = TriggerEventHooks('swapItems', {
+            source = source,
+            fromInventory = dropId,
+            fromSlot = data,
+            fromType = 'drop',
+            toInventory = source,
+            toType = 'player',
+            count = total,
+            -- (a number, as upstream passes for a move into an empty slot:
+            -- the target slot is only known once AddItem placed the item)
+            toSlot = 0,
+            action = 'move',
+            oxlynDrops = true,
+        })
+
+        if not hooks.success then
+            left += total
+            goto continue
+        end
+
+        while count > 0 and not Inventory.CanCarryItem(player, name, count, data.metadata) do
+            count = math.floor(count / 2)
+        end
+
+        if count > 0 and Inventory.RemoveItem(drop, name, count, data.metadata, entry.slot) then
+            if Inventory.AddItem(player, name, count, data.metadata) then
+                taken += count
+                left += total - count
+                takenMap[name] = (takenMap[name] or 0) + count
+                if not firstTakenName then firstTakenName = name end
+            else
+                Inventory.AddItem(drop, name, count, data.metadata, entry.slot)
+                hooks.success = false
+                left += total
+            end
+        else
+            hooks.success = false
+            left += total
+        end
+
+        ::continue::
+    end
+
+    if taken > 0 then
+        drop.time = os.time()
+
+        if server.loglevel and server.loglevel > 0 then
+            lib.logger(player.owner, 'swapSlots', ('%sx %s transferred from "%s" to "%s"'):format(taken, firstTakenName, dropId, player.label))
+        end
+
+        if okLog then
+            -- (pcall: a log sink error after the transfer answered nil and the client opened the drop)
+            pcall(Log.record, 'pickup', {
+                item = firstTakenName,
+                count = taken,
+                from = drop,
+                to = player,
+                actor = source,
+                coords = drop.coords,
+                extra = { dropId = dropId, taken = takenMap, left = left, names = names },
+            })
+        end
+
+        if not next(drop.items) then
+            Inventory.Remove(drop)
+        end
+    end
+
+    return taken > 0, taken, left
+end)
+
+return Drops

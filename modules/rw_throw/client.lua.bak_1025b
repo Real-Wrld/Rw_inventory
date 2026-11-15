@@ -1,0 +1,872 @@
+if not lib then return end
+
+RWThrow = {}
+
+local Config = RWThrowConfig or {}
+local BALL_WEAPON = `WEAPON_BALL`
+local BALL_MODEL_HASH = -383950123
+
+local throwingActive = false
+local handProp = nil
+local itemName, slotIndex, propModelName = nil, nil, nil
+local customHandPos, customHandRot = nil, nil
+local throwCount = 0
+local otherPlayerProps = {}
+
+local activeDrops = {}
+local isPickingUp = false
+
+-- ─── Config helpers ────────────────────────────────────────────────────────────
+
+--- Resolve world prop from bablo throwProps catalog first (correct in-game models).
+--- Item definition props are only a last resort — the old path used them first and broke throws.
+local function getThrowPropConfig(name)
+    if name then
+        local lower = name:lower()
+
+        for key, value in pairs(Config.throwProps or {}) do
+            if key:lower() == lower then
+                if type(value) == 'table' then
+                    return value.prop or Config.defaultProp or 'prop_paper_bag_small', value.pos, value.rot
+                end
+                return value, nil, nil
+            end
+        end
+
+        local itemData = exports.ox_inventory:Items(name)
+        local clientProp = itemData and itemData.client and itemData.client.prop
+
+        if type(clientProp) == 'string' and clientProp ~= '' and not clientProp:find('^WEAPON_', 1, true) then
+            return clientProp, nil, nil
+        end
+    end
+
+    return Config.defaultProp or 'prop_paper_bag_small', nil, nil
+end
+
+local function requestThrowModel(model)
+    local hash = type(model) == 'string' and joaat(model) or model
+    if not IsModelValid(hash) then return false end
+    if HasModelLoaded(hash) then return true end
+
+    RequestModel(hash)
+    local attempts = 0
+
+    while not HasModelLoaded(hash) and attempts < 200 do
+        Wait(0)
+        attempts = attempts + 1
+    end
+
+    return HasModelLoaded(hash)
+end
+
+local function createThrowProp(propModel, pos, networkSync)
+    local hash = joaat(propModel)
+
+    if not requestThrowModel(hash) then
+        hash = joaat(Config.defaultProp or 'prop_paper_bag_small')
+        if not requestThrowModel(hash) then return nil end
+    end
+
+    local entity = CreateObject(hash, pos.x, pos.y, pos.z, networkSync or false, true, false)
+
+    if entity and DoesEntityExist(entity) then
+        SetEntityCollision(entity, false, false)
+        SetModelAsNoLongerNeeded(hash)
+    end
+
+    return entity
+end
+
+local function getThrowHandBone(ped)
+    if not IsPedInAnyVehicle(ped, false) then return Config.handBone or 57005 end
+
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    local seatIndex = -1
+
+    for i = -1, 3 do
+        if GetPedInVehicleSeat(vehicle, i) == ped then
+            seatIndex = i
+            break
+        end
+    end
+
+    return (seatIndex == -1 or seatIndex == 1) and 18905 or 57005
+end
+
+local function attachThrowPropToHand(prop, ped)
+    if not prop or not DoesEntityExist(prop) then return end
+
+    local boneIdx = GetPedBoneIndex(ped, getThrowHandBone(ped))
+    local pos = customHandPos or Config.throwDefaultHandPos or vec3(0.11, 0.01, -0.03)
+    local rot = customHandRot or Config.throwDefaultHandRot or vec3(-60.0, 0.0, 0.0)
+
+    AttachEntityToEntity(prop, ped, boneIdx, pos.x, pos.y, pos.z, rot.x, rot.y, rot.z, true, true, false, true, 1, true)
+end
+
+local function equipBallWeapon(ped)
+    GiveWeaponToPed(ped, BALL_WEAPON, 1, false, true)
+    SetPedAmmo(ped, BALL_WEAPON, 1)
+    SetPedInfiniteAmmoClip(ped, true)
+    SetPedInfiniteAmmo(ped, true, BALL_WEAPON)
+    SetCurrentPedWeapon(ped, BALL_WEAPON, true)
+end
+
+local function enterThrowState()
+    pcall(function() exports.ox_inventory:weaponWheel(true) end)
+    LocalPlayer.state:set('rwThrowActive', true, true)
+end
+
+local function exitThrowState()
+    pcall(function() exports.ox_inventory:weaponWheel(false) end)
+    LocalPlayer.state:set('rwThrowActive', false, true)
+end
+
+local function showThrowTextUI()
+    lib.showTextUI(Config.textUI or '[LMB] Throw  ·  [RMB] Aim  ·  [X] Cancel', {
+        position = 'bottom-center',
+        icon = 'fa-solid fa-baseball',
+    })
+end
+
+local function hideThrowTextUI()
+    lib.hideTextUI()
+end
+
+-- ─── Trajectory preview (from legacy RW throw) ───────────────────────────────
+
+local function calculateTrajectory(startPos, camRot)
+    local force = Config.force or 15.0
+    local gravity = Config.gravity or 9.81
+    local traj = Config.trajectory or {}
+    local points = {}
+
+    local dir = vec3(
+        -math.sin(math.rad(camRot.z)) * math.abs(math.cos(math.rad(camRot.x))),
+        math.cos(math.rad(camRot.z)) * math.abs(math.cos(math.rad(camRot.x))),
+        math.sin(math.rad(camRot.x))
+    )
+
+    local velX, velY, velZ = dir.x * force, dir.y * force, dir.z * force
+    local step = traj.step or 0.08
+    local count = traj.points or 20
+
+    for i = 1, count do
+        local t = i * step
+        points[i] = vec3(
+            startPos.x + velX * t,
+            startPos.y + velY * t,
+            startPos.z + velZ * t - 0.5 * gravity * t * t
+        )
+    end
+
+    return points
+end
+
+local function drawTrajectory(points)
+    local traj = Config.trajectory or {}
+    local color = traj.color or { 32, 201, 151 }
+    local alpha = traj.alpha or 255
+    local numPoints = #points
+
+    for i = 1, numPoints - 1 do
+        local p1, p2 = points[i], points[i + 1]
+        local currentAlpha = math.floor((1.0 - i / numPoints) * alpha)
+        DrawLine(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, color[1], color[2], color[3], currentAlpha)
+    end
+
+    local marker = traj.landingMarker
+    local endPoint = points[numPoints]
+
+    if marker and marker.enabled and endPoint then
+        DrawMarker(
+            marker.type or 28,
+            endPoint.x, endPoint.y, endPoint.z,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            marker.scale or 0.1, marker.scale or 0.1, marker.scale or 0.1,
+            marker.color[1], marker.color[2], marker.color[3], marker.alpha or 180,
+            false, true, 2, false, nil, nil, false
+        )
+    end
+end
+
+-- ─── Ball helpers ────────────────────────────────────────────────────────────
+
+local function findNearbyBall(ped)
+    local origin = GetEntityCoords(ped)
+
+    for _, obj in ipairs(GetGamePool('CObject')) do
+        if DoesEntityExist(obj) and GetEntityModel(obj) == BALL_MODEL_HASH and not otherPlayerProps[obj] then
+            local dist = #(origin - GetEntityCoords(obj))
+            if dist < 40.0 then
+                local vel = GetEntityVelocity(obj)
+                local inAir = IsEntityInAir(obj)
+                if inAir or #vel > 0.001 then
+                    return obj
+                end
+            end
+        end
+    end
+end
+
+local function findNearbyFlyingBall(ped)
+    local origin = GetEntityCoords(ped)
+
+    for _, obj in ipairs(GetGamePool('CObject')) do
+        if DoesEntityExist(obj) and GetEntityModel(obj) == BALL_MODEL_HASH then
+            local dist = #(origin - GetEntityCoords(obj))
+            if dist < 30.0 then
+                local vel = GetEntityVelocity(obj)
+                if IsEntityInAir(obj) and #vel > 5.0 then
+                    return obj
+                end
+            end
+        end
+    end
+end
+
+local function cleanupStaleBalls(ped)
+    local pedCoords = GetEntityCoords(ped)
+
+    for _, obj in ipairs(GetGamePool('CObject')) do
+        if DoesEntityExist(obj) and GetEntityModel(obj) == BALL_MODEL_HASH then
+            local dist = #(pedCoords - GetEntityCoords(obj))
+            if dist < 30.0 then
+                local vel = GetEntityVelocity(obj)
+                if #vel < 0.1 and not IsEntityInAir(obj) then
+                    SetEntityAsMissionEntity(obj, true, true)
+                    DeleteEntity(obj)
+                end
+            end
+        end
+    end
+end
+
+local function watchForLanding(ballEntity, flyingPropEntity, currentThrowCount)
+    CreateThread(function()
+        local ped = cache.ped
+        local detectHit = Config.landing and Config.landing.detectPlayerHit
+
+        while ballEntity and DoesEntityExist(ballEntity) do
+            Wait(0)
+
+            local vel = GetEntityVelocity(ballEntity)
+            local inAir = IsEntityInAir(ballEntity)
+
+            if detectHit and HasEntityCollidedWithAnything(ballEntity) then
+                for _, playerId in ipairs(GetActivePlayers()) do
+                    local playerPed = GetPlayerPed(playerId)
+                    if playerPed ~= ped and IsEntityTouchingEntity(ballEntity, playerPed) and not IsPedRagdoll(playerPed) then
+                        TriggerServerEvent('rw_inventory:throwHit', GetPlayerServerId(playerId), GetEntityVelocity(ballEntity))
+                        break
+                    end
+                end
+            end
+
+            if #vel < 0.3 and not inAir then
+                Wait(800)
+                break
+            end
+        end
+
+        local landedPos
+
+        if flyingPropEntity and DoesEntityExist(flyingPropEntity) then
+            landedPos = GetEntityCoords(flyingPropEntity)
+            DeleteEntity(flyingPropEntity)
+        elseif ballEntity and DoesEntityExist(ballEntity) then
+            landedPos = GetEntityCoords(ballEntity)
+        end
+
+        if ballEntity and DoesEntityExist(ballEntity) then
+            DeleteEntity(ballEntity)
+        end
+
+        if landedPos then
+            TriggerServerEvent('rw_inventory:throw:land', propModelName, landedPos, vector3(0, 0, 0), currentThrowCount)
+            TriggerServerEvent('rw_inventory:throw:finalize', landedPos, currentThrowCount)
+        end
+    end)
+end
+
+-- ─── Cancel / cleanup ────────────────────────────────────────────────────────
+
+local function cancelThrow(suppressServerEvent)
+    local ped = cache.ped
+
+    throwingActive = false
+    hideThrowTextUI()
+    exitThrowState()
+
+    if handProp and DoesEntityExist(handProp) then DeleteEntity(handProp) end
+    handProp = nil
+    itemName, slotIndex, propModelName = nil, nil, nil
+    customHandPos, customHandRot = nil, nil
+
+    SetPedInfiniteAmmoClip(ped, false)
+    SetPedInfiniteAmmo(ped, false, BALL_WEAPON)
+    RemoveAllPedWeapons(ped, true)
+    SetCurrentPedWeapon(ped, `WEAPON_UNARMED`, true)
+    SetPedCanSwitchWeapon(ped, true)
+
+    if not suppressServerEvent then
+        TriggerServerEvent('rw_inventory:throw:clearState')
+    end
+end
+
+function RWThrow.Cancel()
+    if not throwingActive then return end
+    cancelThrow()
+    ClearPedTasks(cache.ped)
+end
+
+function RWThrow.IsActive()
+    return throwingActive
+end
+
+-- ─── Multiplayer sync ────────────────────────────────────────────────────────
+
+local function parsePlayerBagId(bagName)
+    if not bagName:find('player:') then return nil end
+    return tonumber(bagName:gsub('player:', ''))
+end
+
+local function isLocalPlayer(serverId)
+    return serverId == cache.serverId
+end
+
+local function getPedFromServerId(serverId)
+    local player = GetPlayerFromServerId(serverId)
+    if player == -1 then return nil end
+    local ped = GetPlayerPed(player)
+    return DoesEntityExist(ped) and ped or nil
+end
+
+local function cleanOtherPlayerProps(serverId)
+    local entry = otherPlayerProps[serverId]
+    if not entry then return end
+
+    if type(entry) == 'table' then
+        if entry.handProp and DoesEntityExist(entry.handProp) then DeleteEntity(entry.handProp) end
+        if entry.flyingProp and DoesEntityExist(entry.flyingProp) then DeleteEntity(entry.flyingProp) end
+    end
+
+    otherPlayerProps[serverId] = nil
+end
+
+AddStateBagChangeHandler('rw_throwMode', nil, function(bagName, _, newValue)
+    local serverId = parsePlayerBagId(bagName)
+    if not serverId or isLocalPlayer(serverId) then return end
+
+    local otherPed = getPedFromServerId(serverId)
+    if not otherPed then return end
+
+    local syncDist = Config.syncDistance or 100.0
+    if #(GetEntityCoords(cache.ped) - GetEntityCoords(otherPed)) > syncDist then return end
+
+    cleanOtherPlayerProps(serverId)
+
+    if newValue and newValue.propModel then
+        local prop = createThrowProp(newValue.propModel, GetEntityCoords(otherPed), false)
+        if prop then
+            attachThrowPropToHand(prop, otherPed)
+            otherPlayerProps[serverId] = { handProp = prop, propModel = newValue.propModel }
+        end
+    end
+end)
+
+AddStateBagChangeHandler('rw_throwData', nil, function(bagName, _, newValue)
+    local serverId = parsePlayerBagId(bagName)
+    if not serverId or isLocalPlayer(serverId) or not newValue or not newValue.propModel then return end
+
+    local otherPed = getPedFromServerId(serverId)
+    if not otherPed then return end
+
+    local syncDist = Config.syncDistance or 100.0
+    if #(GetEntityCoords(cache.ped) - GetEntityCoords(otherPed)) > syncDist then return end
+
+    local entry = otherPlayerProps[serverId]
+    if entry and entry.handProp and DoesEntityExist(entry.handProp) then
+        DeleteEntity(entry.handProp)
+        entry.handProp = nil
+    end
+
+    CreateThread(function()
+        local propModel = newValue.propModel
+        local flyingProp, trackedBall
+        local attempts = 0
+
+        Wait(50)
+
+        while attempts < 100 and not trackedBall do
+            trackedBall = findNearbyFlyingBall(otherPed)
+            if trackedBall then break end
+            Wait(20)
+            attempts = attempts + 1
+        end
+
+        if not trackedBall then return end
+
+        SetEntityVisible(trackedBall, false, false)
+
+        local ballPos = GetEntityCoords(trackedBall)
+        flyingProp = createThrowProp(propModel, ballPos, false)
+
+        if flyingProp and DoesEntityExist(flyingProp) then
+            AttachEntityToEntity(flyingProp, trackedBall, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false, false, false, false, 0, true)
+
+            otherPlayerProps[serverId] = {
+                handProp = entry and entry.handProp or nil,
+                flyingProp = flyingProp,
+                trackedBall = trackedBall,
+                propModel = propModel,
+            }
+        end
+
+        local ticks = 0
+        while ticks < 500 do
+            Wait(20)
+            ticks = ticks + 1
+            if not trackedBall or not DoesEntityExist(trackedBall) then break end
+
+            local vel = GetEntityVelocity(trackedBall)
+            if #vel < 0.5 and not IsEntityInAir(trackedBall) then
+                Wait(500)
+                if flyingProp and DoesEntityExist(flyingProp) then DeleteEntity(flyingProp) end
+                if trackedBall and DoesEntityExist(trackedBall) then DeleteEntity(trackedBall) end
+                otherPlayerProps[serverId] = nil
+                break
+            end
+        end
+
+        if flyingProp and DoesEntityExist(flyingProp) then DeleteEntity(flyingProp) end
+        if trackedBall and DoesEntityExist(trackedBall) then DeleteEntity(trackedBall) end
+        otherPlayerProps[serverId] = nil
+    end)
+end)
+
+RegisterNetEvent('rw_inventory:throw:propLanded', function(ownerServerId)
+    if ownerServerId == cache.serverId then return end
+    cleanOtherPlayerProps(ownerServerId)
+end)
+
+-- ─── Core throw mode (bablo WEAPON_BALL + visible prop) ──────────────────────
+
+function RWThrow.Start(item)
+    if throwingActive then return end
+    if not item or not item.name or not item.slot then return end
+
+    local itemData = exports.ox_inventory:Items(item.name)
+    if itemData and itemData.permanent then
+        return lib.notify({
+            description = locale('permanent_cannot_throw', itemData.label or item.name),
+            type = 'error',
+        })
+    end
+
+    local propModel, handPos, handRot = getThrowPropConfig(item.name)
+    customHandPos, customHandRot = handPos, handRot
+
+    throwCount = throwCount + 1
+    local myThrowCount = throwCount
+
+    enterThrowState()
+
+    RequestWeaponAsset(BALL_WEAPON, 31, 0)
+    if joaat(propModel) ~= 0 then RequestModel(joaat(propModel)) end
+    Wait(0)
+
+    local ped = cache.ped
+
+    if IsEntityDead(ped) then
+        exitThrowState()
+        return lib.notify({ description = 'You cannot throw items while dead', type = 'error' })
+    end
+
+    if handProp and DoesEntityExist(handProp) then
+        DeleteEntity(handProp)
+        handProp = nil
+    end
+
+    RemoveAllPedWeapons(ped, true)
+    Wait(0)
+    cleanupStaleBalls(ped)
+
+    throwingActive = true
+    itemName = item.name
+    slotIndex = item.slot
+    propModelName = propModel
+
+    TriggerServerEvent('rw_inventory:throw:enterMode', propModelName, itemName, slotIndex, myThrowCount)
+
+    local attempts = 0
+    while not HasWeaponAssetLoaded(BALL_WEAPON) and attempts < 400 do
+        Wait(0)
+        attempts = attempts + 1
+    end
+
+    if not HasWeaponAssetLoaded(BALL_WEAPON) then
+        throwingActive = false
+        exitThrowState()
+        TriggerServerEvent('rw_inventory:throw:clearState')
+        return lib.notify({ description = 'Failed to start throw mode', type = 'error' })
+    end
+
+    equipBallWeapon(ped)
+    SetPedCanSwitchWeapon(ped, false)
+
+    local pedCoords = GetEntityCoords(ped)
+    handProp = createThrowProp(propModelName, pedCoords, false)
+
+    if handProp then
+        attachThrowPropToHand(handProp, ped)
+    end
+
+    local currentHandBone = getThrowHandBone(ped)
+
+    CreateThread(function()
+        while throwingActive and handProp and DoesEntityExist(handProp) do
+            Wait(100)
+            local newBone = getThrowHandBone(cache.ped)
+            if newBone ~= currentHandBone then
+                currentHandBone = newBone
+                DetachEntity(handProp, true, true)
+                attachThrowPropToHand(handProp, cache.ped)
+            end
+        end
+    end)
+
+    showThrowTextUI()
+
+    -- Trajectory preview while aiming
+    CreateThread(function()
+        local aimOffset = (Config.offsets and Config.offsets.aim) or vec3(0.0, 0.8, 0.5)
+        local traj = Config.trajectory
+
+        while throwingActive do
+            if traj and traj.enabled and IsPlayerFreeAiming(PlayerId()) then
+                local startPos = GetOffsetFromEntityInWorldCoords(cache.ped, aimOffset.x, aimOffset.y, aimOffset.z)
+                drawTrajectory(calculateTrajectory(startPos, GetGameplayCamRot(0)))
+            end
+            Wait(0)
+        end
+    end)
+
+    CreateThread(function()
+        while throwingActive do
+            Wait(0)
+            DisableControlAction(0, 37, true)
+            DisableControlAction(0, 157, true)
+            DisableControlAction(0, 158, true)
+            DisableControlAction(0, 159, true)
+            DisableControlAction(0, 160, true)
+            DisableControlAction(0, 164, true)
+            DisableControlAction(0, 165, true)
+
+            if GetAmmoInPedWeapon(cache.ped, BALL_WEAPON) < 1 then
+                SetPedAmmo(cache.ped, BALL_WEAPON, 1)
+            end
+        end
+    end)
+
+    CreateThread(function()
+        local tracking = false
+        local shootTimer = 0
+
+        while throwingActive do
+            Wait(0)
+
+            local currentPed = cache.ped
+            if not DoesEntityExist(currentPed) or IsEntityDead(currentPed) then
+                cancelThrow()
+                break
+            end
+
+            local weaponEntity = GetCurrentPedWeaponEntityIndex(currentPed)
+            if weaponEntity and DoesEntityExist(weaponEntity) and IsEntityVisible(weaponEntity) then
+                SetEntityVisible(weaponEntity, false, false)
+            end
+
+            if IsControlJustPressed(0, Config.cancelControl or 73) then
+                hideThrowTextUI()
+                cancelThrow()
+                lib.notify({ description = 'Throw cancelled', type = 'inform' })
+                break
+            end
+
+            if not tracking then
+                local _, currentWeapon = GetCurrentPedWeapon(currentPed)
+
+                if currentWeapon == BALL_WEAPON and IsPedShooting(currentPed) then
+                    shootTimer = GetGameTimer()
+                    hideThrowTextUI()
+                end
+
+                if shootTimer > 0 then
+                    local elapsed = GetGameTimer() - shootTimer
+                    local ballEntity = findNearbyBall(currentPed)
+
+                    if ballEntity then
+                        tracking = true
+                        otherPlayerProps[ballEntity] = true
+
+                        local vel = GetEntityVelocity(ballEntity)
+                        SetEntityVelocity(ballEntity, vel.x * 0.7, vel.y * 0.7, vel.z * 0.7)
+                        SetEntityVisible(ballEntity, false, false)
+
+                        if handProp and DoesEntityExist(handProp) then
+                            DeleteEntity(handProp)
+                            handProp = nil
+                        end
+
+                        local ballPos = GetEntityCoords(ballEntity)
+                        TriggerServerEvent('rw_inventory:throw:sync', propModelName, ballPos, vel)
+
+                        local flyingProp = createThrowProp(propModelName, ballPos, false)
+                        if flyingProp then
+                            AttachEntityToEntity(flyingProp, ballEntity, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false, false, false, false, 0, true)
+                        end
+
+                        throwingActive = false
+                        exitThrowState()
+                        SetPedInfiniteAmmoClip(currentPed, false)
+                        SetPedInfiniteAmmo(currentPed, false, BALL_WEAPON)
+                        SetPedCanSwitchWeapon(currentPed, true)
+                        RemoveWeaponFromPed(currentPed, BALL_WEAPON)
+                        SetCurrentPedWeapon(currentPed, `WEAPON_UNARMED`, true)
+
+                        watchForLanding(ballEntity, flyingProp, myThrowCount)
+                        itemName, slotIndex, propModelName = nil, nil, nil
+                        break
+                    elseif elapsed >= 1500 then
+                        local footPos = GetEntityCoords(currentPed)
+
+                        for _, obj in ipairs(GetGamePool('CObject')) do
+                            if DoesEntityExist(obj) and GetEntityModel(obj) == BALL_MODEL_HASH and #(footPos - GetEntityCoords(obj)) < 30.0 then
+                                SetEntityAsMissionEntity(obj, true, true)
+                                DeleteEntity(obj)
+                            end
+                        end
+
+                        TriggerServerEvent('rw_inventory:throw:land', propModelName, footPos, vector3(0, 0, 0), myThrowCount)
+                        TriggerServerEvent('rw_inventory:throw:finalize', footPos, myThrowCount)
+                        cancelThrow(true)
+                        break
+                    end
+                end
+            end
+        end
+    end)
+end
+
+RegisterCommand('cancelthrow', function()
+    RWThrow.Cancel()
+end, false)
+
+-- ─── Thrown drop pickup overlay ──────────────────────────────────────────────
+
+local function handlePickup(dropId)
+    if isPickingUp then return end
+    isPickingUp = true
+    RWThrow.Cancel()
+
+    SetTimeout((Config.pickup and Config.pickup.serverCallDelay) or 0, function()
+        lib.callback('rw_inventory:pickupThrownDrop', false, function(success)
+            isPickingUp = false
+            ClearPedTasks(cache.ped)
+            if not success then
+                lib.notify({ description = 'Cannot pick up this item', type = 'error' })
+            end
+        end, dropId)
+    end)
+end
+
+local function addTargetZone(dropId, coords)
+    if GetResourceState('ox_target') ~= 'started' then return end
+
+    local dropTarget = Config.dropInteraction or {}
+    local zoneId = exports.ox_target:addSphereZone({
+        coords = coords,
+        radius = dropTarget.target and dropTarget.target.radius or 0.4,
+        debug = false,
+        options = {
+            {
+                name = ('rw_inventory:throwPickup_%s'):format(dropId),
+                icon = dropTarget.icon or 'fas fa-hand',
+                label = dropTarget.label or 'Pick up item',
+                distance = dropTarget.target and dropTarget.target.distance or 2.0,
+                onSelect = function()
+                    handlePickup(dropId)
+                end,
+            },
+        },
+    })
+
+    activeDrops[dropId] = { coords = coords, zoneId = zoneId, mode = 'target' }
+end
+
+local function setupDropInteraction(dropId, coords)
+    if activeDrops[dropId] then return end
+
+    local intType = Config.dropInteraction and Config.dropInteraction.type or 'text3d'
+    if intType == 'none' then return end
+
+    if intType == 'target' then
+        addTargetZone(dropId, coords)
+    else
+        activeDrops[dropId] = { coords = coords, mode = intType }
+    end
+end
+
+local function removeDropInteraction(dropId)
+    local dropInfo = activeDrops[dropId]
+    if not dropInfo then return end
+
+    if dropInfo.zoneId and GetResourceState('ox_target') == 'started' then
+        exports.ox_target:removeZone(dropInfo.zoneId)
+    end
+
+    activeDrops[dropId] = nil
+end
+
+RegisterNetEvent('rw_inventory:throwHit', function(velocity)
+    if not velocity then return end
+
+    local hitConfig = Config.hit or {}
+    SetPedToRagdoll(cache.ped, hitConfig.ragdollDuration or 3000, hitConfig.ragdollDuration or 3000, 0, false, false, false)
+
+    if type(velocity) == 'vector3' then
+        local divisor = hitConfig.velocityDivisor or 6.0
+        SetEntityVelocity(cache.ped, velocity.x / divisor, velocity.y / divisor, velocity.z / divisor)
+    end
+end)
+
+RegisterNetEvent('ox_inventory:createDrop', function(dropId, dropData)
+    if dropData and dropData.thrown and dropData.coords then
+        setupDropInteraction(dropId, dropData.coords)
+    end
+end)
+
+RegisterNetEvent('rw_inventory:thrownDrop', function(dropId, dropData)
+    if dropData and dropData.coords then
+        setupDropInteraction(dropId, dropData.coords)
+    end
+end)
+
+RegisterNetEvent('ox_inventory:removeDrop', function(dropId)
+    removeDropInteraction(dropId)
+end)
+
+RegisterNetEvent('ox_inventory:setPlayerInventory', function(inventory)
+    if type(inventory) ~= 'table' then return end
+
+    for dropId, dropData in pairs(inventory) do
+        if dropData.thrown and dropData.coords then
+            setupDropInteraction(dropId, dropData.coords)
+        end
+    end
+end)
+
+local function drawText3D(coords, text, textConfig)
+    SetDrawOrigin(coords.x, coords.y, coords.z, 0)
+    SetTextFont(textConfig.font or 4)
+    SetTextProportional(1)
+    SetTextScale(0.0, textConfig.scale or 0.35)
+    SetTextColour(textConfig.color[1], textConfig.color[2], textConfig.color[3], textConfig.alpha or 255)
+    SetTextDropshadow(0, 0, 0, 0, 255)
+    SetTextDropShadow()
+    SetTextEdge(2, 0, 0, 0, 150)
+    SetTextOutline()
+    SetTextEntry('STRING')
+    SetTextCentre(1)
+    AddTextComponentString(text)
+    DrawText(0.0, 0.0)
+    ClearDrawOrigin()
+end
+
+CreateThread(function()
+    local currentTextUI = nil
+
+    while true do
+        local intType = Config.dropInteraction and Config.dropInteraction.type or 'text3d'
+
+        if intType ~= 'text3d' and intType ~= 'textui' then
+            if currentTextUI then
+                lib.hideTextUI()
+                currentTextUI = nil
+            end
+            Wait(1000)
+        elseif not next(activeDrops) then
+            if currentTextUI then
+                lib.hideTextUI()
+                currentTextUI = nil
+            end
+            Wait(1000)
+        else
+            local pedCoords = GetEntityCoords(cache.ped)
+            local closestDropId, closestDist = nil, nil
+
+            for dropId, dropInfo in pairs(activeDrops) do
+                local dist = #(pedCoords - dropInfo.coords)
+                if not closestDist or dist < closestDist then
+                    closestDist = dist
+                    closestDropId = dropId
+                end
+            end
+
+            if closestDist and closestDist > 5.0 then
+                if currentTextUI then
+                    lib.hideTextUI()
+                    currentTextUI = nil
+                end
+                Wait(500)
+            elseif intType == 'text3d' then
+                local text3d = Config.dropInteraction.text3d or {}
+
+                for dropId, dropInfo in pairs(activeDrops) do
+                    local dist = #(pedCoords - dropInfo.coords)
+                    if dist <= (text3d.maxDistance or 3.0) then
+                        local drawCoords = vec3(dropInfo.coords.x, dropInfo.coords.y, dropInfo.coords.z + (text3d.zOffset or 0.3))
+                        drawText3D(drawCoords, text3d.message or '[E] Pick up', text3d)
+                        if not closestDist or dist < closestDist then
+                            closestDist = dist
+                            closestDropId = dropId
+                        end
+                    end
+                end
+
+                if closestDropId and IsControlJustReleased(0, text3d.key or 38) then
+                    handlePickup(closestDropId)
+                end
+
+                Wait(0)
+            else
+                local textui = Config.dropInteraction.textui or {}
+                local activeDrop = closestDist and closestDist <= (textui.maxDistance or 1.5) and closestDropId or nil
+
+                if activeDrop then
+                    if currentTextUI ~= activeDrop then
+                        currentTextUI = activeDrop
+                        lib.showTextUI(textui.message or '[E] Pick up', {
+                            position = textui.position or 'right-center',
+                            icon = textui.icon,
+                        })
+                    end
+
+                    if IsControlJustReleased(0, textui.key or 38) then
+                        handlePickup(activeDrop)
+                    end
+                elseif currentTextUI then
+                    lib.hideTextUI()
+                    currentTextUI = nil
+                end
+
+                Wait(0)
+            end
+        end
+    end
+end)
+
+exports('startThrow', function(...) return RWThrow.Start(...) end)
+exports('isThrowActive', function(...) return RWThrow.IsActive(...) end)
+exports('cancelThrow', function(...) return RWThrow.Cancel(...) end)

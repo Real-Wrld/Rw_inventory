@@ -1,0 +1,22 @@
+
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# dependencies
+# misc
+# production
+# testing
+.DS_Store
+.env.development.local
+.env.local
+.env.production.local
+.env.test.local
+.pnp.js
+.pnpm-debug.log
+/.pnp
+/build
+/coverage
+/node_modules
+_art_inbox/*.zip
+_art_inbox/.venv
+_art_inbox/kenney_*
+_art_inbox/node_modules
+npm-debug.log*
