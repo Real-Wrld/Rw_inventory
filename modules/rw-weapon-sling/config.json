@@ -1,0 +1,55 @@
+{
+  "Debug": false,
+  "Locale": "en",
+  "UniqueKvpId": "real-wrld",
+  "MaxVisibleSlings": 4,
+  "UseWeaponAttachments": true,
+  "UseHolsteredModels": true,
+  "HideWhenEquipped": true,
+  "HideInVehicle": true,
+  "Command": {
+    "name": "sling",
+    "description": "Personal weapon sling editor — /sling admin for global presets",
+    "permission": "admin"
+  },
+  "Presets": {
+    "command": "slingpreset",
+    "permission": "admin",
+    "aliasOf": "sling"
+  },
+  "Admin": {
+    "Global": {
+      "enabled": true,
+      "players": [],
+      "ace": "rw-inventory.sling.admin"
+    }
+  },
+  "Bones": {
+    "back": 24816,
+    "front": 24818,
+    "hip_right": 51826,
+    "hip_left": 58271,
+    "chest": 24818
+  },
+  "Weapons": {
+    "WEAPON_PISTOL": { "model": "w_pi_pistol" },
+    "WEAPON_COMBATPISTOL": { "model": "w_pi_combatpistol" },
+    "WEAPON_PISTOL50": { "model": "w_pi_pistol50" },
+    "WEAPON_APPISTOL": { "model": "w_pi_appistol" },
+    "WEAPON_MICROSMG": { "model": "w_sb_microsmg" },
+    "WEAPON_SMG": { "model": "w_sb_smg" },
+    "WEAPON_ASSAULTRIFLE": { "model": "w_ar_assaultrifle" },
+    "WEAPON_CARBINERIFLE": { "model": "w_ar_carbinerifle" },
+    "WEAPON_ADVANCEDRIFLE": { "model": "w_ar_advancedrifle" },
+    "WEAPON_PUMPSHOTGUN": { "model": "w_sg_pumpshotgun" },
+    "WEAPON_GLOCK19": { "model": "w_pi_glock19" },
+    "WEAPON_AR-15HW": { "model": "w_ar_ar15hw" }
+  },
+  "Blacklist": {
+    "WEAPON_UNARMED": true,
+    "WEAPON_PETROLCAN": true,
+    "WEAPON_FIREEXTINGUISHER": true,
+    "WEAPON_HAZARDCAN": true,
+    "WEAPON_FERTILIZERCAN": true
+  }
+}

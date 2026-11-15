@@ -1,0 +1,7 @@
+*.log
+*.pem
+.DS_Store
+.env*
+credentials.json
+web/dist/
+web/node_modules/
